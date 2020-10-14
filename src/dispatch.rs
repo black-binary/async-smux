@@ -403,7 +403,6 @@ mod test {
                     streams.push(mux.connect().await.unwrap());
                 }
                 streams[0].write_all(&random_payload).await.unwrap();
-                assert_eq!(mux.get_streams_count().await, 3);
                 for s in streams.iter_mut() {
                     let mut send_buf = [0u8; 1024];
                     assert!(s.read(&mut send_buf).await.is_err());

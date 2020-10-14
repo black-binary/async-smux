@@ -11,11 +11,11 @@ futures = "0.3"
 bytes = "0.5"
 rand = "0.7"
 log = "0.4"
-smol = "*"
+smol = "1"
 
 [dev-dependencies]
-smol = "*"
-async-std = "*"
+smol = "1"
+async-std = "1"
 bytes = "0.5"
 
 [profile.release]
