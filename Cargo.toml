@@ -1,0 +1,20 @@
+[package]
+name = "async_smux"
+version = "0.0.1"
+authors = ["black-binary"]
+edition = "2018"
+
+[dependencies]
+futures = "0.3"
+bytes = "0.5"
+rand = "0.7"
+log = "0.4"
+smol = "*"
+
+[dev-dependencies]
+smol = "*"
+async-std = "*"
+bytes = "0.5"
+
+[profile.release]
+debug = true
