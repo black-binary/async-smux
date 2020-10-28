@@ -1,4 +1,4 @@
-use async_smux::{dispatch::MuxStream, Mux};
+use async_smux::{MuxDispatcher, MuxStream};
 use smol::{channel, net::TcpListener, net::TcpStream, prelude::*};
 
 async fn get_tcp_stream_pair() -> (TcpStream, TcpStream) {
@@ -15,10 +15,10 @@ async fn get_tcp_stream_pair() -> (TcpStream, TcpStream) {
     (client_stream, server_stream)
 }
 
-async fn get_mux_stream_pair() -> (Mux, Mux, MuxStream, MuxStream) {
+async fn get_mux_stream_pair() -> (MuxDispatcher, MuxDispatcher, MuxStream, MuxStream) {
     let (stream1, stream2) = get_tcp_stream_pair().await;
-    let mut mux1 = Mux::new(stream1);
-    let mut mux2 = Mux::new(stream2);
+    let mut mux1 = MuxDispatcher::new(stream1);
+    let mut mux2 = MuxDispatcher::new(stream2);
     let stream1 = mux1.connect().await.unwrap();
     let stream2 = mux2.accept().await.unwrap();
     (mux1, mux2, stream1, stream2)

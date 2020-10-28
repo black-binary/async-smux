@@ -48,7 +48,6 @@ impl MuxDispatcher {
                 loop {
                     let frame = Frame::read_from(&mut reader).await;
                     if frame.is_err() {
-                        // TODO wrong syntax, shutdown
                         log::error!("invalid protocol");
                         return;
                     }
@@ -72,11 +71,9 @@ impl MuxDispatcher {
                             log::trace!("read worker insert: {:08X}", stream_id);
                         }
                         Command::Push => {
-                            let mut map = local_tx_map.lock().await;
-                            // TODO lock
-                            if let Some(tx) = map.get_mut(&frame.stream_id) {
+                            if let Some(tx) = local_tx_map.lock().await.get_mut(&frame.stream_id) {
                                 if tx.send(frame.payload).await.is_err() {
-                                    map.remove(&frame.stream_id);
+                                    local_tx_map.lock().await.remove(&frame.stream_id);
                                     log::trace!(
                                         "read worker: stream {:08X} closed, id removed",
                                         frame.stream_id
@@ -139,7 +136,7 @@ impl MuxDispatcher {
         if let Some(stream) = self.stream_rx.lock().await.next().await {
             Ok(stream)
         } else {
-            Err(Error::new(ErrorKind::BrokenPipe, "Dispacher closed"))
+            Err(Error::new(ErrorKind::BrokenPipe, "dispacher closed"))
         }
     }
 
@@ -281,7 +278,7 @@ impl AsyncWrite for MuxStream {
             stream_id: self.stream_id,
             command: Command::Push,
             length: buf.len() as u16,
-            payload: buf.clone().to_bytes(),
+            payload: Bytes::copy_from_slice(&buf),
         };
         self.tx.try_send(frame).unwrap();
         Ready(Ok(buf.len()))
@@ -301,7 +298,6 @@ impl AsyncWrite for MuxStream {
             length: 0,
             payload: Bytes::new(),
         };
-        // TODO loop
         self.tx.try_send(frame).unwrap();
         self.rx.close();
         self.closed = true;
@@ -389,7 +385,7 @@ mod test {
                     let id = i;
                     let task = smol::spawn(async move {
                         let send_buf = [id as u8; 1024];
-                        stream.write_all(&send_buf).await.unwrap();
+                        stream.write(&send_buf).await.unwrap();
                         stream.close().await.unwrap();
                         println!("thread {} closed", id);
                     });

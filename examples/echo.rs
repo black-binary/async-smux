@@ -1,11 +1,11 @@
-use async_smux::Mux;
+use async_smux::MuxDispatcher;
 use smol::net::{TcpListener, TcpStream};
 use smol::prelude::*;
 
 async fn echo_server() {
     let listener = TcpListener::bind("0.0.0.0:12345").await.unwrap();
     let (stream, _) = listener.accept().await.unwrap();
-    let mut mux = Mux::new(stream);
+    let mut mux = MuxDispatcher::new(stream);
     loop {
         let mut mux_stream = mux.accept().await.unwrap();
         let mut buf = [0u8; 1024];
@@ -19,7 +19,7 @@ fn main() {
     smol::block_on(async {
         smol::Timer::after(std::time::Duration::from_secs(1)).await;
         let stream = TcpStream::connect("127.0.0.1:12345").await.unwrap();
-        let mut mux = Mux::new(stream);
+        let mut mux = MuxDispatcher::new(stream);
         for i in 0..100 {
             let mut mux_stream = mux.connect().await.unwrap();
             let mut buf = [0u8; 1024];

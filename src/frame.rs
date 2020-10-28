@@ -74,9 +74,9 @@ impl Frame {
         header_buf.put_u8(self.command.to_u8());
         header_buf.put_u16(self.length);
         header_buf.put_u32(self.stream_id);
-        writer.write_all(&header_buf).await?;
+        writer.write(&header_buf).await?;
         if self.payload.len() != 0 {
-            writer.write_all(&self.payload).await?;
+            writer.write(&self.payload).await?;
         }
         Ok(())
     }

@@ -1,4 +1,5 @@
-pub mod dispatch;
-pub mod frame;
+mod dispatch;
+mod frame;
 
-pub type Mux = dispatch::MuxDispatcher;
+pub type MuxDispatcher = dispatch::MuxDispatcher;
+pub type MuxStream = dispatch::MuxStream;
