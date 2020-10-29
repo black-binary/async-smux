@@ -27,11 +27,12 @@ mod frame;
 ///
 /// A dispatcher can establish multiple `MuxStream` over the underlying stream.
 ///
+#[derive(Clone)]
 pub struct MuxDispatcher {
     local_frame_tx_map: Arc<Mutex<HashMap<u32, Sender<Frame>>>>,
     global_frame_rx: Sender<Frame>,
     stream_rx: Arc<Mutex<Receiver<MuxStream>>>,
-    _task: Task<()>,
+    _task: Arc<Task<()>>,
 }
 
 impl MuxDispatcher {
@@ -41,7 +42,7 @@ impl MuxDispatcher {
     }
 
     /// Consumes an async stream to crate a new dispatcher
-    pub fn new<T: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static>(inner: T) -> Self {
+    pub fn new<T: AsyncRead + AsyncWrite + Send + 'static>(inner: T) -> Self {
         let local_tx_map = Arc::new(Mutex::new(HashMap::new()));
         let (mut reader, mut writer) = inner.split();
         let (mut stream_tx, stream_rx) = channel(0x10);
@@ -49,9 +50,9 @@ impl MuxDispatcher {
 
         let read_worker = {
             let local_frame_tx_map = local_tx_map.clone();
-            let global_tx = global_frame_tx.clone();
+            let global_frame_tx = global_frame_tx.clone();
             async move {
-                let local_tx_map = local_frame_tx_map.clone();
+                let local_frame_tx_map = local_frame_tx_map.clone();
                 loop {
                     let frame = Frame::read_from(&mut reader).await;
                     if let Err(e) = frame {
@@ -65,7 +66,7 @@ impl MuxDispatcher {
                             let (local_frame_tx, local_frame_rx) = channel(0x100);
                             let stream = MuxStream {
                                 stream_id: stream_id,
-                                tx: global_tx.clone(),
+                                tx: global_frame_tx.clone(),
                                 rx: local_frame_rx,
                                 read_buf: None,
                                 write_buf: VecDeque::new(),
@@ -75,16 +76,21 @@ impl MuxDispatcher {
                                 log::debug!("dispatcher closed");
                                 return;
                             }
-                            local_tx_map.lock().await.insert(stream_id, local_frame_tx);
+                            local_frame_tx_map
+                                .lock()
+                                .await
+                                .insert(stream_id, local_frame_tx);
                             log::trace!("read worker insert: {:08X}", stream_id);
                         }
                         Command::Push => {
-                            if let Some(tx) =
-                                local_tx_map.lock().await.get_mut(&frame.header.stream_id)
+                            if let Some(tx) = local_frame_tx_map
+                                .lock()
+                                .await
+                                .get_mut(&frame.header.stream_id)
                             {
                                 let stream_id = frame.header.stream_id;
                                 if tx.send(frame).await.is_err() {
-                                    local_tx_map.lock().await.remove(&stream_id);
+                                    local_frame_tx_map.lock().await.remove(&stream_id);
                                     log::trace!(
                                         "read worker: stream {:08X} closed, id removed",
                                         stream_id
@@ -96,7 +102,10 @@ impl MuxDispatcher {
                         }
                         Command::Nop => {}
                         Command::Finish => {
-                            local_tx_map.lock().await.remove(&frame.header.stream_id);
+                            local_frame_tx_map
+                                .lock()
+                                .await
+                                .remove(&frame.header.stream_id);
                             log::trace!("read worker: fin command {:08X}", frame.header.stream_id);
                         }
                     };
@@ -138,7 +147,7 @@ impl MuxDispatcher {
             global_frame_rx: global_frame_tx,
             stream_rx: Arc::new(Mutex::new(stream_rx)),
             local_frame_tx_map: local_tx_map,
-            _task: race_task,
+            _task: Arc::new(race_task),
         }
     }
 
@@ -209,8 +218,6 @@ impl MuxStream {
     }
 }
 
-impl Unpin for MuxStream {}
-
 impl Drop for MuxStream {
     fn drop(&mut self) {
         if !self.closed {
@@ -273,7 +280,7 @@ impl AsyncRead for MuxStream {
 }
 
 impl MuxStream {
-    fn flush_write_buf(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
+    fn flush_write_buf(&mut self, cx: &mut Context) -> Poll<Result<()>> {
         loop {
             if self.write_buf.is_empty() {
                 break;
