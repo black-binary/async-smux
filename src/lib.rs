@@ -268,15 +268,15 @@ impl AsyncRead for MuxStream {
         }
 
         if let Some(frame) = ready!(self.rx.poll_next_unpin(cx)) {
-            let payload = frame.get_payload();
+            let mut payload = frame.into_payload();
             if buf.len() >= payload.len() {
-                buf[..payload.len()].copy_from_slice(&payload[..]);
+                buf[..payload.len()].copy_from_slice(&payload);
                 Ready(Ok(payload.len()))
             } else {
                 let buf_len = buf.len();
                 buf[..].copy_from_slice(&payload[..buf_len]);
-                // TODO optimization
-                self.read_buf = Some(Bytes::copy_from_slice(&payload[buf_len..]));
+                payload.advance(buf_len);
+                self.read_buf = Some(payload);
                 Ready(Ok(buf_len))
             }
         } else {
@@ -374,7 +374,7 @@ mod test {
 
     fn init() {
         let _ = env_logger::builder()
-            .filter_level(log::LevelFilter::Debug)
+            .filter_level(log::LevelFilter::Error)
             .try_init();
         std::env::set_var("SMOL_THREADS", "4");
     }

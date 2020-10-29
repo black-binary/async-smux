@@ -79,8 +79,9 @@ pub struct Frame {
 }
 
 impl Frame {
-    pub fn get_payload(&self) -> &[u8] {
-        &self.packet[8..]
+    pub fn into_payload(mut self) -> Bytes {
+        self.packet.advance(8);
+        self.packet
     }
 
     pub async fn read_from<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Self> {
@@ -204,7 +205,7 @@ mod test {
                 frame.header.command.to_u8()
             );
             assert_eq!(new_frame.header.length, frame.header.length);
-            assert_eq!(new_frame.get_payload(), frame.get_payload());
+            assert_eq!(new_frame.into_payload(), frame.into_payload());
 
             let invalid_buf = [1u8, 4, 5, 6, 7, 1, 1, 1, 1, 1, 1, 1];
             let mut cursor = Cursor::new(&invalid_buf);
