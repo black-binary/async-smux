@@ -15,6 +15,10 @@ async fn echo_server() {
 }
 
 fn main() {
+    env_logger::builder()
+        .filter_level(log::LevelFilter::Debug)
+        .try_init()
+        .unwrap();
     smol::spawn(echo_server()).detach();
     smol::block_on(async {
         smol::Timer::after(std::time::Duration::from_secs(1)).await;

@@ -2,7 +2,9 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use futures::prelude::*;
 use std::io::{Cursor, Error, ErrorKind, Result};
 
-#[derive(Eq, PartialEq, Debug)]
+pub const MAX_PAYLOAD_LENGTH: usize = 0xffff;
+
+#[derive(Eq, PartialEq, Debug, Clone)]
 pub enum Command {
     Sync,
     Finish,
@@ -33,59 +35,120 @@ impl Command {
     }
 }
 
-pub struct Frame {
+#[derive(Clone)]
+pub struct FrameHeader {
     pub version: u8,
     pub command: Command,
-    pub length: u16,
+    pub length: usize,
     pub stream_id: u32,
-    pub payload: Bytes,
 }
 
-impl Frame {
-    pub async fn read_from<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Self> {
-        let mut header_buf = [0u8; 8];
-        reader.read_exact(&mut header_buf[..]).await?;
-        let mut cursor = Cursor::new(&header_buf);
-        let version = cursor.get_u8();
+impl FrameHeader {
+    #[inline]
+    fn write_to<B: BufMut>(&self, buf: &mut B) {
+        buf.put_u8(self.version);
+        buf.put_u8(self.command.to_u8());
+        buf.put_u16(self.length as u16);
+        buf.put_u32(self.stream_id);
+    }
+
+    #[inline]
+    fn read_from_buf(buf: &[u8; 8]) -> Result<Self> {
+        let mut buf = Cursor::new(buf);
+        let version = buf.get_u8();
         if version != 1 {
             return Err(Error::new(ErrorKind::InvalidData, "invalid protocol"));
         }
-        let command = Command::from_u8(cursor.get_u8())?;
-        let length = cursor.get_u16();
-        let stream_id = cursor.get_u32();
-        let mut payload = BytesMut::with_capacity(length as usize);
-        if length != 0 {
-            payload.resize(length as usize, 0);
-            reader.read_exact(&mut payload).await?;
-        }
-        let payload = payload.freeze();
+        let command = Command::from_u8(buf.get_u8())?;
+        let length = buf.get_u16() as usize;
+        let stream_id = buf.get_u32();
         Ok(Self {
             version,
             command,
             length,
             stream_id,
-            payload,
         })
+    }
+}
+
+#[derive(Clone)]
+pub struct Frame {
+    pub header: FrameHeader,
+    packet: Bytes,
+}
+
+impl Frame {
+    pub fn get_payload(&self) -> &[u8] {
+        &self.packet[8..]
+    }
+
+    pub async fn read_from<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Self> {
+        let mut header_buf = [0u8; 8];
+        reader.read_exact(&mut header_buf[..]).await?;
+        let header = FrameHeader::read_from_buf(&header_buf)?;
+        let mut packet = BytesMut::with_capacity(8 + header.length);
+        packet.extend_from_slice(&header_buf);
+        if header.length != 0 {
+            unsafe {
+                packet.set_len(8 + header.length);
+            }
+            reader.read_exact(&mut packet[8..]).await?;
+        }
+        let packet = packet.freeze();
+        Ok(Self { header, packet })
     }
 
     pub async fn write_to<W: AsyncWrite + Unpin>(&self, writer: &mut W) -> Result<()> {
-        let mut header_buf = BytesMut::with_capacity(8);
-        header_buf.put_u8(self.version);
-        header_buf.put_u8(self.command.to_u8());
-        header_buf.put_u16(self.length);
-        header_buf.put_u32(self.stream_id);
-        writer.write(&header_buf).await?;
-        if self.payload.len() != 0 {
-            writer.write(&self.payload).await?;
-        }
+        writer.write_all(&self.packet).await?;
         Ok(())
+    }
+
+    pub fn new_sync_frame(stream_id: u32) -> Self {
+        let mut packet = BytesMut::with_capacity(8);
+        let header = FrameHeader {
+            version: 1,
+            command: Command::Sync,
+            length: 0,
+            stream_id: stream_id,
+        };
+        header.write_to(&mut packet);
+        let packet = packet.freeze();
+        Self { header, packet }
+    }
+
+    pub fn new_push_frame(stream_id: u32, payload: &[u8]) -> Self {
+        assert!(payload.len() <= MAX_PAYLOAD_LENGTH);
+        let mut packet = BytesMut::with_capacity(8 + payload.len());
+        let header = FrameHeader {
+            version: 1,
+            command: Command::Push,
+            length: payload.len(),
+            stream_id: stream_id,
+        };
+        header.write_to(&mut packet);
+        packet.extend_from_slice(payload);
+        let packet = packet.freeze();
+        Self { header, packet }
+    }
+
+    pub fn new_finish_frame(stream_id: u32) -> Self {
+        let mut packet = BytesMut::with_capacity(8);
+        let header = FrameHeader {
+            version: 1,
+            command: Command::Finish,
+            length: 0,
+            stream_id: stream_id,
+        };
+        header.write_to(&mut packet);
+        let packet = packet.freeze();
+        Self { header, packet }
     }
 }
 
 #[cfg(test)]
 mod test {
-    use super::{Command, Frame};
-    use bytes::Bytes;
+    use super::{Command, Frame, FrameHeader};
+    use bytes::BytesMut;
     use smol::io::Cursor;
     #[test]
     fn test_command() {
@@ -112,30 +175,43 @@ mod test {
     fn test_frame() {
         smol::block_on(async {
             let mut cursor = Cursor::new(Vec::<u8>::new());
-            let payload = Bytes::from_static(b"payload12345678");
+            let payload = b"payload12345678";
+
+            let header = FrameHeader {
+                version: 1,
+                command: Command::Sync,
+                length: payload.len(),
+                stream_id: 1234,
+            };
+            let mut packet = BytesMut::new();
+            header.write_to(&mut packet);
+            packet.extend_from_slice(payload);
 
             let frame = Frame {
-                version: 1,
-                stream_id: 1234,
-                command: Command::Sync,
-                length: payload.len() as u16,
-                payload: payload,
+                header: header,
+                packet: packet.freeze(),
             };
 
             frame.write_to(&mut cursor).await.unwrap();
 
             let mut cursor = Cursor::new(cursor.get_ref());
             let new_frame = Frame::read_from(&mut cursor).await.unwrap();
-            assert_eq!(new_frame.version, frame.version);
-            assert_eq!(new_frame.stream_id, frame.stream_id);
-            assert_eq!(new_frame.command.to_u8(), frame.command.to_u8());
-            assert_eq!(new_frame.length, frame.length);
-            assert_eq!(new_frame.payload.to_vec(), frame.payload.to_vec());
+            assert_eq!(new_frame.header.version, frame.header.version);
+            assert_eq!(new_frame.header.stream_id, frame.header.stream_id);
+            assert_eq!(
+                new_frame.header.command.to_u8(),
+                frame.header.command.to_u8()
+            );
+            assert_eq!(new_frame.header.length, frame.header.length);
+            assert_eq!(new_frame.get_payload(), frame.get_payload());
 
             let invalid_buf = [1u8, 4, 5, 6, 7, 1, 1, 1, 1, 1, 1, 1];
             let mut cursor = Cursor::new(&invalid_buf);
             assert!(Frame::read_from(&mut cursor).await.is_err());
             let invalid_buf = [3u8, 4, 8, 6, 7, 1, 1, 1, 1, 1, 11, 1, 1];
+            let mut cursor = Cursor::new(&invalid_buf);
+            assert!(Frame::read_from(&mut cursor).await.is_err());
+            let invalid_buf = [0u8];
             let mut cursor = Cursor::new(&invalid_buf);
             assert!(Frame::read_from(&mut cursor).await.is_err());
         });

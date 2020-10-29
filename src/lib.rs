@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    collections::VecDeque,
     io::Error,
     io::ErrorKind,
     io::Result,
@@ -10,6 +11,7 @@ use std::{
 };
 
 use bytes::{Buf, Bytes};
+use frame::MAX_PAYLOAD_LENGTH;
 use frame::{Command, Frame};
 use futures::prelude::*;
 use futures::ready;
@@ -26,7 +28,7 @@ mod frame;
 /// A dispatcher can establish multiple `MuxStream` over the underlying stream.
 ///
 pub struct MuxDispatcher {
-    local_tx_map: Arc<Mutex<HashMap<u32, Sender<Bytes>>>>,
+    local_tx_map: Arc<Mutex<HashMap<u32, Sender<Frame>>>>,
     global_tx: Sender<Frame>,
     stream_rx: Arc<Mutex<Receiver<MuxStream>>>,
     _task: Task<()>,
@@ -43,7 +45,7 @@ impl MuxDispatcher {
         let local_tx_map = Arc::new(Mutex::new(HashMap::new()));
         let (mut reader, mut writer) = inner.split();
         let (mut stream_tx, stream_rx) = channel(128);
-        let (global_tx, mut global_rx) = channel(1024);
+        let (global_tx, mut global_rx) = channel(0x500);
 
         let read_worker = {
             let local_tx_map = local_tx_map.clone();
@@ -52,20 +54,21 @@ impl MuxDispatcher {
                 let local_tx_map = local_tx_map.clone();
                 loop {
                     let frame = Frame::read_from(&mut reader).await;
-                    if frame.is_err() {
-                        log::error!("invalid protocol");
+                    if let Err(e) = frame {
+                        log::error!("closing underlying stream: {}", e);
                         return;
                     }
                     let frame = frame.unwrap();
-                    match frame.command {
+                    match frame.header.command {
                         Command::Sync => {
-                            let stream_id = frame.stream_id;
-                            let (local_tx, local_rx) = channel(128);
+                            let stream_id = frame.header.stream_id;
+                            let (local_tx, local_rx) = channel(0x100);
                             let stream = MuxStream {
                                 stream_id: stream_id,
                                 tx: global_tx.clone(),
                                 rx: local_rx,
-                                last_read: None,
+                                read_buf: None,
+                                write_buf: VecDeque::new(),
                                 closed: false,
                             };
                             if stream_tx.send(stream).await.is_err() {
@@ -76,24 +79,27 @@ impl MuxDispatcher {
                             log::trace!("read worker insert: {:08X}", stream_id);
                         }
                         Command::Push => {
-                            if let Some(tx) = local_tx_map.lock().await.get_mut(&frame.stream_id) {
-                                if tx.send(frame.payload).await.is_err() {
-                                    local_tx_map.lock().await.remove(&frame.stream_id);
+                            if let Some(tx) =
+                                local_tx_map.lock().await.get_mut(&frame.header.stream_id)
+                            {
+                                let stream_id = frame.header.stream_id;
+                                if tx.send(frame).await.is_err() {
+                                    local_tx_map.lock().await.remove(&stream_id);
                                     log::trace!(
                                         "read worker: stream {:08X} closed, id removed",
-                                        frame.stream_id
+                                        stream_id
                                     );
                                 }
                             } else {
-                                log::error!("stream id {:08X} not found", frame.stream_id);
+                                log::error!("stream id {:08X} not found", frame.header.stream_id);
                             }
                         }
                         Command::Nop => {
                             // TODO keepalive
                         }
                         Command::Finish => {
-                            local_tx_map.lock().await.remove(&frame.stream_id);
-                            log::trace!("read worker: fin command {:08X}", frame.stream_id);
+                            local_tx_map.lock().await.remove(&frame.header.stream_id);
+                            log::trace!("read worker: fin command {:08X}", frame.header.stream_id);
                         }
                     };
                 }
@@ -110,12 +116,13 @@ impl MuxDispatcher {
                         return;
                     }
                     let frame = frame.unwrap();
-                    if let Command::Finish = frame.command {
-                        log::trace!("write worker: {:08X}", frame.stream_id);
-                        local_tx_map.lock().await.remove(&frame.stream_id);
+                    if let Command::Finish = frame.header.command {
+                        log::trace!("write worker: {:08X}", frame.header.stream_id);
+                        local_tx_map.lock().await.remove(&frame.header.stream_id);
                     }
                     let result = frame.write_to(&mut writer).await;
-                    if result.is_err() {
+                    if let Err(e) = result {
+                        log::error!("failed to write frame to stream: {}", e.to_string());
                         return;
                     }
                 }
@@ -155,22 +162,17 @@ impl MuxDispatcher {
                 break;
             }
         }
-        let (local_tx, local_rx) = channel(128);
+        let (local_tx, local_rx) = channel(0);
         let global_tx = self.global_tx.clone();
         let stream = MuxStream {
             stream_id: stream_id,
             tx: global_tx,
             rx: local_rx,
-            last_read: None,
+            read_buf: None,
+            write_buf: VecDeque::new(),
             closed: false,
         };
-        let frame = Frame {
-            version: 1,
-            stream_id,
-            command: Command::Sync,
-            length: 0,
-            payload: Bytes::new(),
-        };
+        let frame = Frame::new_sync_frame(stream_id);
         if self.global_tx.send(frame).await.is_err() {
             return Err(Error::new(
                 ErrorKind::ConnectionRefused,
@@ -188,9 +190,10 @@ impl MuxDispatcher {
 /// A `MuxStream` is created by `MuxDispatcher`. It implements the AsyncRead and AsyncWrite traits.
 pub struct MuxStream {
     stream_id: u32,
-    rx: Receiver<Bytes>,
+    rx: Receiver<Frame>,
     tx: Sender<Frame>,
-    last_read: Option<Bytes>,
+    read_buf: Option<Bytes>,
+    write_buf: VecDeque<Frame>,
     closed: bool,
 }
 
@@ -205,13 +208,8 @@ impl Unpin for MuxStream {}
 impl Drop for MuxStream {
     fn drop(&mut self) {
         if !self.closed {
-            let frame = Frame {
-                version: 1,
-                stream_id: self.stream_id,
-                command: Command::Finish,
-                length: 0,
-                payload: Bytes::new(),
-            };
+            let stream_id = self.stream_id;
+            let frame = Frame::new_finish_frame(stream_id);
             if !self.tx.is_closed() {
                 log::trace!("stream {:08X} droped", self.stream_id);
                 if let Err(e) = self.tx.try_send(frame) {
@@ -220,13 +218,7 @@ impl Drop for MuxStream {
                         let stream_id = self.stream_id;
                         log::trace!("stream {:08X} dropped, tx full", stream_id);
                         smol::spawn(async move {
-                            let frame = Frame {
-                                version: 1,
-                                stream_id: stream_id,
-                                command: Command::Finish,
-                                length: 0,
-                                payload: Bytes::new(),
-                            };
+                            let frame = Frame::new_finish_frame(stream_id);
                             let _ = tx.send(frame).await;
                         })
                         .detach();
@@ -244,7 +236,7 @@ impl AsyncRead for MuxStream {
         cx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<Result<usize>> {
-        if let Some(mut recv_buf) = self.last_read.take() {
+        if let Some(mut recv_buf) = self.read_buf.take() {
             if buf.len() >= recv_buf.len() {
                 buf[..recv_buf.len()].copy_from_slice(&recv_buf[..]);
                 return Ready(Ok(recv_buf.len()));
@@ -252,25 +244,43 @@ impl AsyncRead for MuxStream {
                 let buf_len = buf.len();
                 buf[..].copy_from_slice(&recv_buf[..buf_len]);
                 recv_buf.advance(buf_len);
-                self.last_read = Some(recv_buf);
+                self.read_buf = Some(recv_buf);
                 return Ready(Ok(buf_len));
             }
         }
 
-        if let Some(mut recv_buf) = ready!(self.rx.poll_next_unpin(cx)) {
-            if buf.len() >= recv_buf.len() {
-                buf[..recv_buf.len()].copy_from_slice(&recv_buf[..]);
-                Ready(Ok(recv_buf.len()))
+        if let Some(frame) = ready!(self.rx.poll_next_unpin(cx)) {
+            let payload = frame.get_payload();
+            if buf.len() >= payload.len() {
+                buf[..payload.len()].copy_from_slice(&payload[..]);
+                Ready(Ok(payload.len()))
             } else {
                 let buf_len = buf.len();
-                buf[..].copy_from_slice(&recv_buf[..buf_len]);
-                recv_buf.advance(buf_len);
-                self.last_read = Some(recv_buf);
+                buf[..].copy_from_slice(&payload[..buf_len]);
+                self.read_buf = Some(Bytes::copy_from_slice(&payload[buf_len..]));
                 Ready(Ok(buf_len))
             }
         } else {
             Ready(Err(Error::new(ErrorKind::ConnectionReset, "stream closed")))
         }
+    }
+}
+
+impl MuxStream {
+    fn flush_write_buf(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        loop {
+            if self.write_buf.is_empty() {
+                break;
+            }
+            ready!(self.tx.poll_ready(cx))
+                .map_err(|e| Error::new(ErrorKind::ConnectionReset, e))?;
+            let frame = self.write_buf.front().unwrap().clone();
+            self.tx
+                .try_send(frame)
+                .map_err(|e| Error::new(ErrorKind::ConnectionReset, e))?;
+            self.write_buf.pop_front();
+        }
+        Ready(Ok(()))
     }
 }
 
@@ -280,35 +290,49 @@ impl AsyncWrite for MuxStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<Result<usize>> {
-        assert!(buf.len() <= 0xffff);
-        ready!(self.tx.poll_ready(cx))
-            .map_err(|_| Error::new(ErrorKind::ConnectionReset, "stream closed"))?;
-        let frame = Frame {
-            version: 1,
-            stream_id: self.stream_id,
-            command: Command::Push,
-            length: buf.len() as u16,
-            payload: Bytes::copy_from_slice(&buf),
-        };
-        self.tx.try_send(frame).unwrap();
+        ready!(self.flush_write_buf(cx))?;
+        ready!(self.tx.poll_ready(cx)).map_err(|e| Error::new(ErrorKind::ConnectionReset, e))?;
+        if buf.len() <= MAX_PAYLOAD_LENGTH {
+            let frame = Frame::new_push_frame(self.stream_id, buf);
+            self.tx
+                .try_send(frame)
+                .map_err(|e| Error::new(ErrorKind::ConnectionReset, e))?;
+        } else {
+            let frame = Frame::new_push_frame(self.stream_id, &buf[..MAX_PAYLOAD_LENGTH]);
+            self.tx
+                .try_send(frame)
+                .map_err(|e| Error::new(ErrorKind::ConnectionReset, e))?;
+            let leftover = &buf[MAX_PAYLOAD_LENGTH..];
+            let frame_count = leftover.len() / MAX_PAYLOAD_LENGTH + 1;
+            for i in 0..frame_count - 1 {
+                let frame = Frame::new_push_frame(
+                    self.stream_id,
+                    &leftover[i * MAX_PAYLOAD_LENGTH..(i + 1) * MAX_PAYLOAD_LENGTH],
+                );
+                self.write_buf.push_back(frame);
+            }
+            let frame = Frame::new_push_frame(
+                self.stream_id,
+                &leftover[(frame_count - 1) * MAX_PAYLOAD_LENGTH..],
+            );
+            self.write_buf.push_back(frame);
+        }
         Ready(Ok(buf.len()))
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<()>> {
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        ready!(self.flush_write_buf(cx))?;
+        ready!(self.tx.poll_ready(cx)).map_err(|e| Error::new(ErrorKind::ConnectionReset, e))?;
         Ready(Ok(()))
     }
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
-        ready!(self.tx.poll_ready(cx))
-            .map_err(|_| Error::new(ErrorKind::NotConnected, "stream closed"))?;
-        let frame = Frame {
-            version: 1,
-            stream_id: self.stream_id,
-            command: Command::Finish,
-            length: 0,
-            payload: Bytes::new(),
-        };
-        self.tx.try_send(frame).unwrap();
+        ready!(self.flush_write_buf(cx))?;
+        let frame = Frame::new_finish_frame(self.stream_id);
+        ready!(self.tx.poll_ready(cx)).map_err(|e| Error::new(ErrorKind::NotConnected, e))?;
+        self.tx
+            .try_send(frame)
+            .map_err(|e| Error::new(ErrorKind::ConnectionReset, e))?;
         self.rx.close();
         self.closed = true;
         Ready(Ok(()))
@@ -486,6 +510,35 @@ mod test {
             let size = client_mux_stream.read(&mut buf).await.unwrap();
             let payload = String::from_utf8(buf[..size].to_vec()).unwrap();
             assert_eq!(payload, "testtest12345678");
+        });
+    }
+
+    #[test]
+    fn huge_payload() {
+        smol::block_on(async {
+            let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
+            let local_addr = listener.local_addr().unwrap();
+            let mut buf = Vec::new();
+            buf.resize(0x20000, 0);
+            rand::thread_rng().fill_bytes(&mut buf);
+
+            let buf1 = buf.clone();
+            smol::spawn(async move {
+                let (server_stream, _) = listener.accept().await.unwrap();
+                let mut server_dispatcher = MuxDispatcher::new(server_stream);
+                let mut server_mux_stream = server_dispatcher.accept().await.unwrap();
+                server_mux_stream.write_all(&buf).await.unwrap();
+                server_mux_stream.close().await.unwrap();
+                println!("done");
+            })
+            .detach();
+            let client_stream = TcpStream::connect(local_addr).await.unwrap();
+            let mut client_dispatcher = MuxDispatcher::new(client_stream);
+            let mut client_mux_stream = client_dispatcher.connect().await.unwrap();
+            let mut buf2 = Vec::new();
+            buf2.resize(0x20000, 0);
+            client_mux_stream.read_exact(&mut buf2).await.unwrap();
+            assert_eq!(buf2, buf1);
         });
     }
 }
