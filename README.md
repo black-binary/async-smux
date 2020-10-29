@@ -1,6 +1,10 @@
 # async-smux
 
-A lightweight asynchronous [smux](https://github.com/xtaci/smux) (Simple MUltipleXing) library for smol / async-std.
+[crates.io](https://crates.io/crates/async_smux)
+
+A lightweight asynchronous [smux](https://github.com/xtaci/smux) (Simple MUltipleXing) library for smol / async-std. 
+
+![img](https://raw.githubusercontent.com/xtaci/smux/master/mux.jpg)
 
 ## Benchmark
 
