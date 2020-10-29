@@ -14,11 +14,15 @@ async fn echo_server() {
     }
 }
 
-fn main() {
-    env_logger::builder()
+fn init() {
+    let _ = env_logger::builder()
         .filter_level(log::LevelFilter::Debug)
-        .try_init()
-        .unwrap();
+        .try_init();
+    std::env::set_var("SMOL_THREADS", "4");
+}
+
+fn main() {
+    init();
     smol::spawn(echo_server()).detach();
     smol::block_on(async {
         smol::Timer::after(std::time::Duration::from_secs(1)).await;
@@ -27,7 +31,8 @@ fn main() {
         for i in 0..100 {
             let mut mux_stream = mux.connect().await.unwrap();
             let mut buf = [0u8; 1024];
-            mux_stream.write(b"hello").await.unwrap();
+            let payload = format!("hello {}", i);
+            mux_stream.write(&payload.as_bytes()).await.unwrap();
             let size = mux_stream.read(&mut buf).await.unwrap();
             let reply = String::from_utf8(buf[..size].to_vec()).unwrap();
             println!("{}: {}", i, reply);
