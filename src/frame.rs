@@ -2,6 +2,7 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use futures::prelude::*;
 use std::io::{Cursor, Error, ErrorKind, Result};
 
+pub const SMUX_VERSION: u8 = 1;
 pub const MAX_PAYLOAD_LENGTH: usize = 0xffff;
 
 #[derive(Eq, PartialEq, Debug, Clone)]
@@ -56,7 +57,7 @@ impl FrameHeader {
     fn read_from_buf(buf: &[u8; 8]) -> Result<Self> {
         let mut buf = Cursor::new(buf);
         let version = buf.get_u8();
-        if version != 1 {
+        if version != SMUX_VERSION {
             return Err(Error::new(ErrorKind::InvalidData, "invalid protocol"));
         }
         let command = Command::from_u8(buf.get_u8())?;
@@ -106,7 +107,7 @@ impl Frame {
     pub fn new_sync_frame(stream_id: u32) -> Self {
         let mut packet = BytesMut::with_capacity(8);
         let header = FrameHeader {
-            version: 1,
+            version: SMUX_VERSION,
             command: Command::Sync,
             length: 0,
             stream_id: stream_id,
@@ -120,7 +121,7 @@ impl Frame {
         assert!(payload.len() <= MAX_PAYLOAD_LENGTH);
         let mut packet = BytesMut::with_capacity(8 + payload.len());
         let header = FrameHeader {
-            version: 1,
+            version: SMUX_VERSION,
             command: Command::Push,
             length: payload.len(),
             stream_id: stream_id,
@@ -134,7 +135,7 @@ impl Frame {
     pub fn new_finish_frame(stream_id: u32) -> Self {
         let mut packet = BytesMut::with_capacity(8);
         let header = FrameHeader {
-            version: 1,
+            version: SMUX_VERSION,
             command: Command::Finish,
             length: 0,
             stream_id: stream_id,
@@ -147,7 +148,7 @@ impl Frame {
 
 #[cfg(test)]
 mod test {
-    use super::{Command, Frame, FrameHeader};
+    use super::{Command, Frame, FrameHeader, SMUX_VERSION};
     use bytes::BytesMut;
     use smol::io::Cursor;
     #[test]
@@ -172,13 +173,13 @@ mod test {
     }
 
     #[test]
-    fn test_frame() {
+    fn frame_parsing() {
         smol::block_on(async {
             let mut cursor = Cursor::new(Vec::<u8>::new());
             let payload = b"payload12345678";
 
             let header = FrameHeader {
-                version: 1,
+                version: SMUX_VERSION,
                 command: Command::Sync,
                 length: payload.len(),
                 stream_id: 1234,

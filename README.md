@@ -1,6 +1,15 @@
 # async-smux
 
-Asynchronous [smux](https://github.com/xtaci/smux) (Simple MUltipleXing) library for smol / async-std.
+A lightweight asynchronous [smux](https://github.com/xtaci/smux) (Simple MUltipleXing) library for smol / async-std.
+
+## Benchmark
+
+| Implementation    | Throughput (TCP) | Handshake  |
+| ----------------- | ---------------- | ---------- |
+| smux (go)         | 0.4854 GiB/s     | 17.070 K/s |
+| async-smux (rust) | 1.1603 GiB/s     | 30.502 K/s |
+
+Check out `/benches` directory for more details.
 
 ## Example
 

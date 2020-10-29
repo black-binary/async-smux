@@ -28,8 +28,8 @@ mod frame;
 /// A dispatcher can establish multiple `MuxStream` over the underlying stream.
 ///
 pub struct MuxDispatcher {
-    local_tx_map: Arc<Mutex<HashMap<u32, Sender<Frame>>>>,
-    global_tx: Sender<Frame>,
+    local_frame_tx_map: Arc<Mutex<HashMap<u32, Sender<Frame>>>>,
+    global_frame_rx: Sender<Frame>,
     stream_rx: Arc<Mutex<Receiver<MuxStream>>>,
     _task: Task<()>,
 }
@@ -37,21 +37,21 @@ pub struct MuxDispatcher {
 impl MuxDispatcher {
     /// Gets the number of connections handled by this dispatcher
     pub async fn get_streams_count(&self) -> usize {
-        self.local_tx_map.lock().await.len()
+        self.local_frame_tx_map.lock().await.len()
     }
 
     /// Consumes an async stream to crate a new dispatcher
     pub fn new<T: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static>(inner: T) -> Self {
         let local_tx_map = Arc::new(Mutex::new(HashMap::new()));
         let (mut reader, mut writer) = inner.split();
-        let (mut stream_tx, stream_rx) = channel(128);
-        let (global_tx, mut global_rx) = channel(0x500);
+        let (mut stream_tx, stream_rx) = channel(0x10);
+        let (global_frame_tx, mut global_frame_rx) = channel(0x500);
 
         let read_worker = {
-            let local_tx_map = local_tx_map.clone();
-            let global_tx = global_tx.clone();
+            let local_frame_tx_map = local_tx_map.clone();
+            let global_tx = global_frame_tx.clone();
             async move {
-                let local_tx_map = local_tx_map.clone();
+                let local_tx_map = local_frame_tx_map.clone();
                 loop {
                     let frame = Frame::read_from(&mut reader).await;
                     if let Err(e) = frame {
@@ -62,11 +62,11 @@ impl MuxDispatcher {
                     match frame.header.command {
                         Command::Sync => {
                             let stream_id = frame.header.stream_id;
-                            let (local_tx, local_rx) = channel(0x100);
+                            let (local_frame_tx, local_frame_rx) = channel(0x100);
                             let stream = MuxStream {
                                 stream_id: stream_id,
                                 tx: global_tx.clone(),
-                                rx: local_rx,
+                                rx: local_frame_rx,
                                 read_buf: None,
                                 write_buf: VecDeque::new(),
                                 closed: false,
@@ -75,7 +75,7 @@ impl MuxDispatcher {
                                 log::debug!("dispatcher closed");
                                 return;
                             }
-                            local_tx_map.lock().await.insert(stream_id, local_tx);
+                            local_tx_map.lock().await.insert(stream_id, local_frame_tx);
                             log::trace!("read worker insert: {:08X}", stream_id);
                         }
                         Command::Push => {
@@ -94,9 +94,7 @@ impl MuxDispatcher {
                                 log::error!("stream id {:08X} not found", frame.header.stream_id);
                             }
                         }
-                        Command::Nop => {
-                            // TODO keepalive
-                        }
+                        Command::Nop => {}
                         Command::Finish => {
                             local_tx_map.lock().await.remove(&frame.header.stream_id);
                             log::trace!("read worker: fin command {:08X}", frame.header.stream_id);
@@ -110,7 +108,7 @@ impl MuxDispatcher {
             let local_tx_map = local_tx_map.clone();
             async move {
                 loop {
-                    let frame = global_rx.next().await;
+                    let frame = global_frame_rx.next().await;
                     if frame.is_none() {
                         log::trace!("write worker: all streams closed");
                         return;
@@ -137,9 +135,9 @@ impl MuxDispatcher {
         });
 
         Self {
-            global_tx: global_tx,
+            global_frame_rx: global_frame_tx,
             stream_rx: Arc::new(Mutex::new(stream_rx)),
-            local_tx_map: local_tx_map,
+            local_frame_tx_map: local_tx_map,
             _task: race_task,
         }
     }
@@ -153,33 +151,41 @@ impl MuxDispatcher {
         }
     }
 
-    /// Spawns a new stream to the peer
+    /// Spawns a new smux stream to the peer
     pub async fn connect(&mut self) -> Result<MuxStream> {
         let mut stream_id: u32;
         loop {
             stream_id = rand::random();
-            if !self.local_tx_map.lock().await.contains_key(&stream_id) {
+            if !self
+                .local_frame_tx_map
+                .lock()
+                .await
+                .contains_key(&stream_id)
+            {
                 break;
             }
         }
-        let (local_tx, local_rx) = channel(0);
-        let global_tx = self.global_tx.clone();
+        let (local_frame_tx, local_frame_rx) = channel(0x100);
+        let global_frame_tx = self.global_frame_rx.clone();
         let stream = MuxStream {
             stream_id: stream_id,
-            tx: global_tx,
-            rx: local_rx,
+            tx: global_frame_tx,
+            rx: local_frame_rx,
             read_buf: None,
             write_buf: VecDeque::new(),
             closed: false,
         };
         let frame = Frame::new_sync_frame(stream_id);
-        if self.global_tx.send(frame).await.is_err() {
+        if self.global_frame_rx.send(frame).await.is_err() {
             return Err(Error::new(
                 ErrorKind::ConnectionRefused,
                 "dispatcher closed",
             ));
         }
-        self.local_tx_map.lock().await.insert(stream_id, local_tx);
+        self.local_frame_tx_map
+            .lock()
+            .await
+            .insert(stream_id, local_frame_tx);
         log::trace!("connect syn insert: {:08X}", stream_id);
         Ok(stream)
     }

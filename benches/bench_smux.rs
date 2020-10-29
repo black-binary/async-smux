@@ -27,66 +27,95 @@ async fn get_mux_stream_pair() -> (MuxDispatcher, MuxDispatcher, MuxStream, MuxS
 }
 
 const PAYLOAD_SIZE: usize = 128 * 1024;
-const ROUND: usize = 1024;
+const SEND_ROUND: usize = 1024;
 
-pub fn tcp_throughput() {
+fn tcp_throughput() {
     smol::block_on(async {
         let (mut stream1, mut stream2) = get_tcp_stream_pair().await;
         let _t1 = smol::spawn(async move {
             let payload = [0u8; PAYLOAD_SIZE];
-            for _ in 0..ROUND {
+            for _ in 0..SEND_ROUND {
                 stream1.write_all(&payload).await.unwrap();
             }
             stream1.close().await.unwrap();
         });
-        let t2 = smol::spawn(async move {
-            let mut payload = [0u8; PAYLOAD_SIZE];
-            loop {
-                if let Ok(_) = stream2.read(&mut payload).await {
-                } else {
-                    break;
-                }
+        let mut payload = [0u8; PAYLOAD_SIZE];
+        loop {
+            if stream2.read_exact(&mut payload).await.is_err() {
+                stream2.close().await.unwrap();
+                break;
             }
-        });
-        t2.await;
+        }
     });
 }
 
-pub fn smux_throughput() {
+fn smux_throughput() {
     smol::block_on(async {
         let (_mux1, _mux2, mut stream1, mut stream2) = get_mux_stream_pair().await;
         let _t1 = smol::spawn(async move {
             let payload = [0u8; PAYLOAD_SIZE];
-            for _ in 0..ROUND {
+            for _ in 0..SEND_ROUND {
                 stream1.write_all(&payload).await.unwrap();
             }
             stream1.close().await.unwrap();
         });
-        let t2 = smol::spawn(async move {
-            let mut payload = [0u8; PAYLOAD_SIZE];
-            loop {
-                if let Ok(_) = stream2.read(&mut payload).await {
-                } else {
-                    break;
-                }
-            }
-        });
-        t2.await;
+        let mut payload = [0u8; PAYLOAD_SIZE];
+        loop {
+            if stream2.read_exact(&mut payload).await.is_err() {
+                stream2.close().await.unwrap();
+                return;
+            };
+        }
     });
 }
 
-pub fn criterion_benchmark(c: &mut Criterion) {
+const HANDSHAKE_ROUND: usize = 1024 * 64;
+
+fn smux_handshake() {
+    smol::block_on(async {
+        let (stream1, stream2) = get_tcp_stream_pair().await;
+        let mut mux1 = MuxDispatcher::new(stream1);
+        let mut mux2 = MuxDispatcher::new(stream2);
+        let _t1 = smol::spawn(async move {
+            for _ in 0..HANDSHAKE_ROUND {
+                let mut stream = mux1.accept().await.unwrap();
+                stream.close().await.unwrap();
+            }
+        });
+        for _ in 0..HANDSHAKE_ROUND {
+            let mut stream = mux2.connect().await.unwrap();
+            stream.close().await.unwrap();
+        }
+    });
+}
+
+pub fn throughput_benchmark(c: &mut Criterion) {
     std::env::set_var("SMOL_THREADS", "8");
     let mut group = c.benchmark_group("throughput");
-    group.throughput(Throughput::Bytes((PAYLOAD_SIZE * ROUND) as u64));
-    group.bench_function("tcp", |b| b.iter(|| smux_throughput()));
+    group.throughput(Throughput::Bytes((PAYLOAD_SIZE * SEND_ROUND) as u64));
     group.bench_function("smux", |b| b.iter(|| smux_throughput()));
-    group.finish()
+    group.bench_function("tcp", |b| b.iter(|| tcp_throughput()));
+    group.finish();
+}
+
+pub fn handshake_benchmark(c: &mut Criterion) {
+    std::env::set_var("SMOL_THREADS", "8");
+    let mut group = c.benchmark_group("handshake");
+    group.throughput(Throughput::Elements(HANDSHAKE_ROUND as u64));
+    group.bench_function("handhsake", |b| b.iter(|| smux_handshake()));
+    group.finish();
 }
 
 criterion_group! {
-    name = benches;
-    config = Criterion::default().sample_size(20).measurement_time(Duration::from_secs(10));
-    targets = criterion_benchmark
+    name = throughput_benches;
+    config = Criterion::default().sample_size(20).measurement_time(Duration::from_secs(30));
+    targets = throughput_benchmark
 }
-criterion_main!(benches);
+
+criterion_group! {
+    name = handhsake_benches;
+    config = Criterion::default().sample_size(20).measurement_time(Duration::from_secs(40));
+    targets = handshake_benchmark
+}
+
+criterion_main!(throughput_benches, handhsake_benches);
