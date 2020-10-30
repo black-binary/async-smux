@@ -84,7 +84,7 @@ impl MuxDispatcher {
                                 stream_id: stream_id,
                                 tx: global_tx.clone(),
                                 rx: local_rx,
-                                read_buf: None,
+                                read_buf: Bytes::new(),
                                 write_buf: VecDeque::new(),
                                 max_payload_length: config.max_payload_length,
                                 closed: false,
@@ -186,7 +186,7 @@ impl MuxDispatcher {
             stream_id: stream_id,
             tx: global_tx,
             rx: local_rx,
-            read_buf: None,
+            read_buf: Bytes::new(),
             write_buf: VecDeque::new(),
             max_payload_length: self.config.max_payload_length,
             closed: false,
@@ -211,7 +211,7 @@ pub struct MuxStream {
     stream_id: u32,
     rx: Receiver<Frame>,
     tx: Sender<Frame>,
-    read_buf: Option<Bytes>,
+    read_buf: Bytes,
     write_buf: VecDeque<Frame>,
     max_payload_length: usize,
     closed: bool,
@@ -254,15 +254,17 @@ impl AsyncRead for MuxStream {
         cx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<Result<usize>> {
-        if let Some(mut recv_buf) = self.read_buf.take() {
-            if buf.len() >= recv_buf.len() {
-                buf[..recv_buf.len()].copy_from_slice(&recv_buf[..]);
-                return Ready(Ok(recv_buf.len()));
+        if self.read_buf.remaining() > 0 {
+            let read_buf = &mut self.read_buf;
+            if buf.len() >= read_buf.len() {
+                let len = read_buf.len();
+                buf[..len].copy_from_slice(&read_buf[..]);
+                read_buf.clear();
+                return Ready(Ok(len));
             } else {
                 let buf_len = buf.len();
-                buf[..].copy_from_slice(&recv_buf[..buf_len]);
-                recv_buf.advance(buf_len);
-                self.read_buf = Some(recv_buf);
+                buf[..].copy_from_slice(&read_buf[..buf_len]);
+                read_buf.advance(buf_len);
                 return Ready(Ok(buf_len));
             }
         }
@@ -276,7 +278,7 @@ impl AsyncRead for MuxStream {
                 let buf_len = buf.len();
                 buf[..].copy_from_slice(&payload[..buf_len]);
                 payload.advance(buf_len);
-                self.read_buf = Some(payload);
+                self.read_buf = payload;
                 Ready(Ok(buf_len))
             }
         } else {
@@ -329,7 +331,7 @@ impl AsyncWrite for MuxStream {
             let frame = Frame::new_push_frame(self.stream_id, &buf[..max_payload_length]);
             ready!(self.send_frame(cx, &frame))?;
 
-            // Buffer the reset
+            // Buffer the rest
             let leftover = &buf[max_payload_length..];
             let frame_count = leftover.len() / max_payload_length + 1;
             for i in 0..frame_count - 1 {
@@ -552,18 +554,17 @@ mod test {
         smol::block_on(async {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let local_addr = listener.local_addr().unwrap();
-            let mut buf = Vec::new();
-            buf.resize(0x30000, 0);
-            rand::thread_rng().fill_bytes(&mut buf);
+            let mut payload = Vec::new();
+            payload.resize(0x30000, 0);
+            rand::thread_rng().fill_bytes(&mut payload);
 
-            let buf1 = buf.clone();
+            let payload_bak = payload.clone();
             smol::spawn(async move {
                 let (server_stream, _) = listener.accept().await.unwrap();
                 let mut server_dispatcher = MuxDispatcher::new(server_stream);
                 let mut server_mux_stream = server_dispatcher.accept().await.unwrap();
-                server_mux_stream.write_all(&buf).await.unwrap();
+                server_mux_stream.write_all(&payload).await.unwrap();
                 server_mux_stream.close().await.unwrap();
-                println!("done");
             })
             .detach();
             let client_stream = TcpStream::connect(local_addr).await.unwrap();
@@ -571,8 +572,13 @@ mod test {
             let mut client_mux_stream = client_dispatcher.connect().await.unwrap();
             let mut buf2 = Vec::new();
             buf2.resize(0x30000, 0);
-            client_mux_stream.read_exact(&mut buf2).await.unwrap();
-            assert_eq!(buf2, buf1);
+            for i in 0..0x10 {
+                client_mux_stream
+                    .read_exact(&mut buf2[i * 0x3000..(i + 1) * 0x3000])
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(buf2, payload_bak);
         });
     }
 }

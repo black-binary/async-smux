@@ -4,7 +4,7 @@ use smol::{channel, net::TcpListener, net::TcpStream, prelude::*};
 use std::time::Duration;
 
 async fn get_tcp_stream_pair() -> (TcpStream, TcpStream) {
-    let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let local_addr = listener.local_addr().unwrap();
     let (tx, rx) = channel::bounded(8);
     smol::spawn(async move {
@@ -33,13 +33,15 @@ fn tcp_throughput() {
     smol::block_on(async {
         let (mut stream1, mut stream2) = get_tcp_stream_pair().await;
         let _t1 = smol::spawn(async move {
-            let payload = [0u8; PAYLOAD_SIZE];
+            let mut payload = Vec::new();
+            payload.resize(PAYLOAD_SIZE, 0);
             for _ in 0..SEND_ROUND {
                 stream1.write_all(&payload).await.unwrap();
             }
             stream1.close().await.unwrap();
         });
-        let mut payload = [0u8; PAYLOAD_SIZE];
+        let mut payload = Vec::new();
+        payload.resize(PAYLOAD_SIZE, 0);
         loop {
             if stream2.read_exact(&mut payload).await.is_err() {
                 stream2.close().await.unwrap();
@@ -53,13 +55,15 @@ fn smux_throughput() {
     smol::block_on(async {
         let (_mux1, _mux2, mut stream1, mut stream2) = get_mux_stream_pair().await;
         let _t1 = smol::spawn(async move {
-            let payload = [0u8; PAYLOAD_SIZE];
+            let mut payload = Vec::new();
+            payload.resize(PAYLOAD_SIZE, 0);
             for _ in 0..SEND_ROUND {
                 stream1.write_all(&payload).await.unwrap();
             }
             stream1.close().await.unwrap();
         });
-        let mut payload = [0u8; PAYLOAD_SIZE];
+        let mut payload = Vec::new();
+        payload.resize(PAYLOAD_SIZE, 0);
         loop {
             if stream2.read_exact(&mut payload).await.is_err() {
                 stream2.close().await.unwrap();
@@ -108,13 +112,13 @@ pub fn handshake_benchmark(c: &mut Criterion) {
 
 criterion_group! {
     name = throughput_benches;
-    config = Criterion::default().sample_size(20).measurement_time(Duration::from_secs(30));
+    config = Criterion::default().sample_size(10).measurement_time(Duration::from_secs(30));
     targets = throughput_benchmark
 }
 
 criterion_group! {
     name = handhsake_benches;
-    config = Criterion::default().sample_size(20).measurement_time(Duration::from_secs(40));
+    config = Criterion::default().sample_size(10).measurement_time(Duration::from_secs(40));
     targets = handshake_benchmark
 }
 
