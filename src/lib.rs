@@ -68,7 +68,7 @@ impl MuxDispatcher {
             let local_tx_map = local_tx_map.clone();
             let global_tx = global_tx.clone();
             async move {
-                log::debug!("read_worker");
+                log::debug!("read_worker spawned");
                 loop {
                     let frame = Frame::read_from(&mut reader).await;
                     if let Err(e) = frame {
@@ -94,7 +94,7 @@ impl MuxDispatcher {
                                 return;
                             }
                             local_tx_map.lock().await.insert(stream_id, local_tx);
-                            log::debug!("read worker insert: {:08X}", stream_id);
+                            log::debug!("read_worker, syn, {:08X} inserted", stream_id);
                         }
                         Command::Push => {
                             let mut tx = {
@@ -114,7 +114,7 @@ impl MuxDispatcher {
                             if tx.send(frame).await.is_err() {
                                 local_tx_map.lock().await.remove(&stream_id);
                                 log::debug!(
-                                    "read worker: stream {:08X} closed, id removed",
+                                    "read_worker: stream object dropped, {:08X} removed",
                                     stream_id
                                 );
                             }
@@ -122,7 +122,7 @@ impl MuxDispatcher {
                         Command::Nop => {}
                         Command::Finish => {
                             local_tx_map.lock().await.remove(&frame.header.stream_id);
-                            log::debug!("read worker: fin command {:08X}", frame.header.stream_id);
+                            log::debug!("read worker: fin, {:08X} removed", frame.header.stream_id);
                         }
                     };
                 }
@@ -130,7 +130,7 @@ impl MuxDispatcher {
         };
 
         let write_worker = {
-            log::debug!("write_worker");
+            log::debug!("write_worker spawned");
             let local_tx_map = local_tx_map.clone();
             async move {
                 loop {
@@ -141,12 +141,15 @@ impl MuxDispatcher {
                     }
                     let frame = frame.unwrap();
                     if let Command::Finish = frame.header.command {
-                        log::debug!("write worker fin: {:08X}", frame.header.stream_id);
+                        log::debug!("write worker, fin: {:08X}", frame.header.stream_id);
                         local_tx_map.lock().await.remove(&frame.header.stream_id);
                     }
                     let result = frame.write_to(&mut writer).await;
                     if let Err(e) = result {
-                        log::error!("failed to write frame to the underlying stream: {}", e);
+                        log::error!(
+                            "failed to write frame bytes to the underlying stream: {}",
+                            e
+                        );
                         break;
                     }
                 }
@@ -174,7 +177,7 @@ impl MuxDispatcher {
         if let Some(stream) = self.stream_rx.lock().await.next().await {
             Ok(stream)
         } else {
-            Err(Error::new(ErrorKind::BrokenPipe, "dispacher closed"))
+            Err(Error::new(ErrorKind::BrokenPipe, "dispatcher closed"))
         }
     }
 
@@ -328,7 +331,6 @@ impl AsyncWrite for MuxStream {
         buf: &[u8],
     ) -> Poll<Result<usize>> {
         ready!(self.flush_write_buf(cx))?;
-        ready!(self.tx.poll_ready(cx)).map_err(|e| Error::new(ErrorKind::ConnectionReset, e))?;
         let max_payload_length = self.max_payload_length;
         if buf.len() <= max_payload_length {
             let frame = Frame::new_push_frame(self.stream_id, buf);
@@ -392,11 +394,9 @@ mod test {
     fn drop() {
         init();
         smol::block_on(async {
-            // init
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let local_addr = listener.local_addr().unwrap();
 
-            // server
             let t = smol::spawn(async move {
                 let (stream, _) = listener.accept().await.unwrap();
                 let mut dispatcher = MuxDispatcher::new(stream);
@@ -416,7 +416,6 @@ mod test {
                 assert_eq!(dispatcher.get_streams_count().await, 3);
             });
 
-            // client
             let stream = TcpStream::connect(local_addr).await.unwrap();
             let mut dispatcher = MuxDispatcher::new(stream);
 
@@ -427,7 +426,6 @@ mod test {
             let _stream3 = dispatcher.connect().await.unwrap();
             assert_eq!(dispatcher.get_streams_count().await, 3);
 
-            // connect and drop
             for _ in 0..100 {
                 let _ = dispatcher.connect().await.unwrap();
             }
