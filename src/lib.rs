@@ -97,19 +97,26 @@ impl MuxDispatcher {
                             log::debug!("read worker insert: {:08X}", stream_id);
                         }
                         Command::Push => {
-                            if let Some(tx) =
-                                local_tx_map.lock().await.get_mut(&frame.header.stream_id)
-                            {
-                                let stream_id = frame.header.stream_id;
-                                if tx.send(frame).await.is_err() {
-                                    local_tx_map.lock().await.remove(&stream_id);
-                                    log::debug!(
-                                        "read worker: stream {:08X} closed, id removed",
-                                        stream_id
+                            let mut tx = {
+                                if let Some(tx) =
+                                    local_tx_map.lock().await.get(&frame.header.stream_id)
+                                {
+                                    tx.clone()
+                                } else {
+                                    log::error!(
+                                        "stream id {:08X} not found",
+                                        frame.header.stream_id
                                     );
+                                    continue;
                                 }
-                            } else {
-                                log::error!("stream id {:08X} not found", frame.header.stream_id);
+                            };
+                            let stream_id = frame.header.stream_id;
+                            if tx.send(frame).await.is_err() {
+                                local_tx_map.lock().await.remove(&stream_id);
+                                log::debug!(
+                                    "read worker: stream {:08X} closed, id removed",
+                                    stream_id
+                                );
                             }
                         }
                         Command::Nop => {}
