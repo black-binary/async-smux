@@ -1,7 +1,6 @@
 use async_smux::{MuxDispatcher, MuxStream};
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use smol::{channel, net::TcpListener, net::TcpStream, prelude::*};
-use std::time::Duration;
 
 async fn get_tcp_stream_pair() -> (TcpStream, TcpStream) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -112,13 +111,13 @@ pub fn handshake_benchmark(c: &mut Criterion) {
 
 criterion_group! {
     name = throughput_benches;
-    config = Criterion::default().sample_size(10).measurement_time(Duration::from_secs(30));
+    config = Criterion::default().sample_size(20);
     targets = throughput_benchmark
 }
 
 criterion_group! {
     name = handhsake_benches;
-    config = Criterion::default().sample_size(10).measurement_time(Duration::from_secs(40));
+    config = Criterion::default().sample_size(20);
     targets = handshake_benchmark
 }
 
