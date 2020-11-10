@@ -1,11 +1,15 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use futures::prelude::*;
-use std::io::{Cursor, Error, ErrorKind, Result};
+use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+use std::io::{self, Cursor, Error, ErrorKind};
+
+use crate::Result;
 
 pub const SMUX_VERSION: u8 = 1;
-pub const MAX_PAYLOAD_LENGTH: usize = 0xffff;
+pub const HEADER_LENGTH: usize = 8;
+pub const MAX_PAYLOAD_SIZE: usize = 0xffff;
 
-#[derive(Eq, PartialEq, Debug, Clone)]
+#[derive(Eq, PartialEq, Debug, Clone, Copy)]
 pub enum Command {
     Sync,
     Finish,
@@ -15,7 +19,7 @@ pub enum Command {
 
 impl Command {
     #[inline]
-    fn from_u8(val: u8) -> Result<Self> {
+    fn from_u8(val: u8) -> io::Result<Self> {
         match val {
             0 => Ok(Command::Sync),
             1 => Ok(Command::Finish),
@@ -36,7 +40,7 @@ impl Command {
     }
 }
 
-#[derive(Clone)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub struct FrameHeader {
     pub version: u8,
     pub command: Command,
@@ -54,7 +58,14 @@ impl FrameHeader {
     }
 
     #[inline]
-    fn read_from_buf(buf: &[u8; 8]) -> Result<Self> {
+    async fn read_from<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<Self> {
+        let mut buf = [0u8; HEADER_LENGTH];
+        reader.read_exact(&mut buf).await?;
+        Self::read_from_buf(&buf)
+    }
+
+    #[inline]
+    pub fn read_from_buf(buf: &[u8; 8]) -> io::Result<Self> {
         let mut buf = Cursor::new(buf);
         let version = buf.get_u8();
         if version != SMUX_VERSION {
@@ -72,150 +83,93 @@ impl FrameHeader {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Frame {
     pub header: FrameHeader,
-    packet: Bytes,
+    pub payload: Bytes,
 }
 
 impl Frame {
-    pub fn into_payload(mut self) -> Bytes {
-        self.packet.advance(8);
-        self.packet
+    async fn read_from<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Self> {
+        let header = FrameHeader::read_from(reader).await?;
+        let mut payload = BytesMut::new();
+        payload.resize(header.length, 0);
+        reader.read_exact(&mut payload).await?;
+        let payload = payload.freeze();
+        Ok(Self { header, payload })
     }
 
-    pub async fn read_from<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Self> {
-        let mut header_buf = [0u8; 8];
-        reader.read_exact(&mut header_buf[..]).await?;
-        let header = FrameHeader::read_from_buf(&header_buf)?;
-        let mut packet = BytesMut::with_capacity(8 + header.length);
-        packet.extend_from_slice(&header_buf);
-        if header.length != 0 {
-            unsafe {
-                packet.set_len(8 + header.length);
-            }
-            reader.read_exact(&mut packet[8..]).await?;
-        }
-        let packet = packet.freeze();
-        Ok(Self { header, packet })
-    }
-
-    pub async fn write_to<W: AsyncWrite + Unpin>(&self, writer: &mut W) -> Result<()> {
-        writer.write_all(&self.packet).await?;
+    async fn write_to<W: AsyncWrite + Unpin>(&self, writer: &mut W) -> Result<()> {
+        let packet = self.encode();
+        writer.write_all(&packet).await?;
         Ok(())
     }
 
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::with_capacity(HEADER_LENGTH + self.header.length);
+        self.header.write_to(&mut buf);
+        buf.extend_from_slice(&self.payload);
+        buf.freeze()
+    }
+
     pub fn new_sync_frame(stream_id: u32) -> Self {
-        let mut packet = BytesMut::with_capacity(8);
         let header = FrameHeader {
             version: SMUX_VERSION,
             command: Command::Sync,
             length: 0,
             stream_id: stream_id,
         };
-        header.write_to(&mut packet);
-        let packet = packet.freeze();
-        Self { header, packet }
+        Self {
+            header,
+            payload: Bytes::new(),
+        }
     }
 
-    pub fn new_push_frame(stream_id: u32, payload: &[u8]) -> Self {
-        assert!(payload.len() <= MAX_PAYLOAD_LENGTH);
-        let mut packet = BytesMut::with_capacity(8 + payload.len());
+    pub fn new_push_frame(stream_id: u32, payload: Bytes) -> Self {
+        assert!(payload.len() <= MAX_PAYLOAD_SIZE);
         let header = FrameHeader {
             version: SMUX_VERSION,
             command: Command::Push,
             length: payload.len(),
             stream_id: stream_id,
         };
-        header.write_to(&mut packet);
-        packet.extend_from_slice(payload);
-        let packet = packet.freeze();
-        Self { header, packet }
+        Self { header, payload }
     }
 
     pub fn new_finish_frame(stream_id: u32) -> Self {
-        let mut packet = BytesMut::with_capacity(8);
         let header = FrameHeader {
             version: SMUX_VERSION,
             command: Command::Finish,
             length: 0,
             stream_id: stream_id,
         };
-        header.write_to(&mut packet);
-        let packet = packet.freeze();
-        Self { header, packet }
+        Self {
+            header,
+            payload: Bytes::new(),
+        }
     }
 }
 
-#[cfg(test)]
-mod test {
-    use super::{Command, Frame, FrameHeader, SMUX_VERSION};
-    use bytes::BytesMut;
-    use smol::io::Cursor;
-    #[test]
-    fn test_command() {
-        assert_eq!(
-            Command::from_u8(Command::Push.to_u8()).unwrap(),
-            Command::Push,
-        );
-        assert_eq!(
-            Command::from_u8(Command::Sync.to_u8()).unwrap(),
-            Command::Sync,
-        );
-        assert_eq!(
-            Command::from_u8(Command::Finish.to_u8()).unwrap(),
-            Command::Finish,
-        );
-        assert_eq!(
-            Command::from_u8(Command::Nop.to_u8()).unwrap(),
-            Command::Nop,
-        );
-        assert!(Command::from_u8(100).is_err());
+pub struct FrameIo<T> {
+    inner: T,
+}
+
+impl<T: AsyncRead + Unpin> FrameIo<T> {
+    pub async fn read_frame(&mut self) -> Result<Frame> {
+        let frame = Frame::read_from(&mut self.inner).await?;
+        Ok(frame)
     }
+}
 
-    #[test]
-    fn frame_parsing() {
-        smol::block_on(async {
-            let mut cursor = Cursor::new(Vec::<u8>::new());
-            let payload = b"payload12345678";
+impl<T: AsyncWrite + Unpin> FrameIo<T> {
+    pub async fn write_frame(&mut self, frame: &Frame) -> Result<()> {
+        frame.write_to(&mut self.inner).await?;
+        Ok(())
+    }
+}
 
-            let header = FrameHeader {
-                version: SMUX_VERSION,
-                command: Command::Sync,
-                length: payload.len(),
-                stream_id: 1234,
-            };
-            let mut packet = BytesMut::new();
-            header.write_to(&mut packet);
-            packet.extend_from_slice(payload);
-
-            let frame = Frame {
-                header: header,
-                packet: packet.freeze(),
-            };
-
-            frame.write_to(&mut cursor).await.unwrap();
-
-            let mut cursor = Cursor::new(cursor.get_ref());
-            let new_frame = Frame::read_from(&mut cursor).await.unwrap();
-            assert_eq!(new_frame.header.version, frame.header.version);
-            assert_eq!(new_frame.header.stream_id, frame.header.stream_id);
-            assert_eq!(
-                new_frame.header.command.to_u8(),
-                frame.header.command.to_u8()
-            );
-            assert_eq!(new_frame.header.length, frame.header.length);
-            assert_eq!(new_frame.into_payload(), frame.into_payload());
-
-            let invalid_buf = [1u8, 4, 5, 6, 7, 1, 1, 1, 1, 1, 1, 1];
-            let mut cursor = Cursor::new(&invalid_buf);
-            assert!(Frame::read_from(&mut cursor).await.is_err());
-            let invalid_buf = [3u8, 4, 8, 6, 7, 1, 1, 1, 1, 1, 11, 1, 1];
-            let mut cursor = Cursor::new(&invalid_buf);
-            assert!(Frame::read_from(&mut cursor).await.is_err());
-            let invalid_buf = [0u8];
-            let mut cursor = Cursor::new(&invalid_buf);
-            assert!(Frame::read_from(&mut cursor).await.is_err());
-        });
+impl<T> FrameIo<T> {
+    pub fn new(inner: T) -> Self {
+        Self { inner }
     }
 }

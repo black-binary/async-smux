@@ -1,4 +1,4 @@
-use async_smux::{MuxDispatcher, MuxStream};
+use async_smux::{Mux, MuxConfig, MuxStream};
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use smol::{channel, net::TcpListener, net::TcpStream, prelude::*};
 
@@ -16,17 +16,22 @@ async fn get_tcp_stream_pair() -> (TcpStream, TcpStream) {
     (client_stream, server_stream)
 }
 
-async fn get_mux_stream_pair() -> (MuxDispatcher, MuxDispatcher, MuxStream, MuxStream) {
+async fn get_mux_stream_pair() -> (
+    Mux<TcpStream>,
+    Mux<TcpStream>,
+    MuxStream<TcpStream>,
+    MuxStream<TcpStream>,
+) {
     let (stream1, stream2) = get_tcp_stream_pair().await;
-    let mut mux1 = MuxDispatcher::new(stream1);
-    let mut mux2 = MuxDispatcher::new(stream2);
+    let mux1 = Mux::new(stream1, MuxConfig::default());
+    let mux2 = Mux::new(stream2, MuxConfig::default());
     let stream1 = mux1.connect().await.unwrap();
     let stream2 = mux2.accept().await.unwrap();
     (mux1, mux2, stream1, stream2)
 }
 
 const PAYLOAD_SIZE: usize = 128 * 1024;
-const SEND_ROUND: usize = 1024;
+const SEND_ROUND: usize = 16 * 1024;
 
 fn tcp_throughput() {
     smol::block_on(async {
@@ -77,8 +82,8 @@ const HANDSHAKE_ROUND: usize = 1024 * 64;
 fn smux_handshake() {
     smol::block_on(async {
         let (stream1, stream2) = get_tcp_stream_pair().await;
-        let mut mux1 = MuxDispatcher::new(stream1);
-        let mut mux2 = MuxDispatcher::new(stream2);
+        let mux1 = Mux::new(stream1, MuxConfig::default());
+        let mux2 = Mux::new(stream2, MuxConfig::default());
         let _t1 = smol::spawn(async move {
             for _ in 0..HANDSHAKE_ROUND {
                 let mut stream = mux1.accept().await.unwrap();
@@ -111,13 +116,13 @@ pub fn handshake_benchmark(c: &mut Criterion) {
 
 criterion_group! {
     name = throughput_benches;
-    config = Criterion::default().sample_size(20);
+    config = Criterion::default().sample_size(10);
     targets = throughput_benchmark
 }
 
 criterion_group! {
     name = handhsake_benches;
-    config = Criterion::default().sample_size(20);
+    config = Criterion::default().sample_size(10);
     targets = handshake_benchmark
 }
 

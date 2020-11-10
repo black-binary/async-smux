@@ -1,6 +1,6 @@
 [package]
 name = "async_smux"
-version = "0.1.3"
+version = "0.2.0"
 authors = ["black-binary <blackbinary@qq.com>"]
 description = "Asynchronous smux library for smol / async-std"
 license = "MIT"
@@ -11,7 +11,9 @@ futures = "0.3"
 bytes = "0.6"
 rand = "0.7"
 log = "0.4"
-smol = "1"
+async-channel = "1.5"
+async-lock = "2.3"
+futures-lite = "1.11"
 
 [dev-dependencies]
 smol = "1"
@@ -24,5 +26,5 @@ criterion = "0.3"
 debug = true
 
 [[bench]]
-name = "bench_smux"
+name = "smol"
 harness = false
