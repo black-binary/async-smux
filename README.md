@@ -2,20 +2,22 @@
 
 [crates.io](https://crates.io/crates/async_smux)
 
-A lightweight asynchronous [smux](https://github.com/xtaci/smux) (Simple MUltipleXing) library for smol / async-std. 
+A lightweight asynchronous [smux](https://github.com/xtaci/smux) (Simple MUltipleXing) library for smol/async-std and any async runtime compatible to `futures`.
 
 ![img](https://raw.githubusercontent.com/xtaci/smux/master/mux.jpg)
 
-async-smux consumes a struct implementing `AsyncRead + AsyncWrite + Unpin + Send`, like TcpStream, TlsStream and anything you like. And then you may spawn multiple `MuxStream`s(up to 65535), which also implements `AsyncRead + AsyncWrite + Unpin + Send`.
+async-smux consumes a struct implementing `AsyncRead + AsyncWrite + Unpin + Send`, like TcpStream and TlsStream. And then you may spawn multiple `MuxStream`s(up to 65535), which also implements `AsyncRead + AsyncWrite + Unpin + Send`.
 
 ## Benchmark
+
+Here is a simple benchmarking result on my local machine, comparing to the original version smux (written in go).
 
 | Implementation    | Throughput (TCP) | Handshake  |
 | ----------------- | ---------------- | ---------- |
 | smux (go)         | 0.4854 GiB/s     | 17.070 K/s |
-| async-smux (rust) | 1.1603 GiB/s     | 30.502 K/s |
+| async-smux (rust) | 1.0550 GiB/s     | 81.774 K/s |
 
-Check out `/benches` directory for more details.
+Run `cargo bench` to test it by yourself. Check out `/benches` directory for more details.
 
 ## Laziness
 
@@ -28,14 +30,14 @@ Any polling operation, including `.read()` ,`.write()`, `accept()` and `connect(
 ## Example
 
 ```rust
-use async_smux::MuxDispatcher;
-use smol::net::{TcpListener, TcpStream};
-use smol::prelude::*;
+use async_smux::{Mux, MuxConfig};
+use async_std::net::{TcpListener, TcpStream};
+use async_std::prelude::*;
 
 async fn echo_server() {
     let listener = TcpListener::bind("0.0.0.0:12345").await.unwrap();
     let (stream, _) = listener.accept().await.unwrap();
-    let mut mux = MuxDispatcher::new(stream);
+    let mux = Mux::new(stream, MuxConfig::default());
     loop {
         let mut mux_stream = mux.accept().await.unwrap();
         let mut buf = [0u8; 1024];
@@ -45,11 +47,11 @@ async fn echo_server() {
 }
 
 fn main() {
-    smol::spawn(echo_server()).detach();
-    smol::block_on(async {
+    async_std::task::spawn(echo_server());
+    async_std::task::block_on(async {
         smol::Timer::after(std::time::Duration::from_secs(1)).await;
         let stream = TcpStream::connect("127.0.0.1:12345").await.unwrap();
-        let mut mux = MuxDispatcher::new(stream);
+        let mux = Mux::new(stream, MuxConfig::default());
         for i in 0..100 {
             let mut mux_stream = mux.connect().await.unwrap();
             let mut buf = [0u8; 1024];
@@ -60,7 +62,4 @@ fn main() {
         }
     });
 }
-
 ```
-
-

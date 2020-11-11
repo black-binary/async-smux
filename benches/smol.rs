@@ -1,3 +1,5 @@
+use std::fs::File;
+
 use async_smux::{Mux, MuxConfig, MuxStream};
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use smol::{channel, net::TcpListener, net::TcpStream, prelude::*};
@@ -77,14 +79,14 @@ fn smux_throughput() {
     });
 }
 
-const HANDSHAKE_ROUND: usize = 1024 * 64;
+const HANDSHAKE_ROUND: usize = 1024 * 64 * 5;
 
 fn smux_handshake() {
     smol::block_on(async {
         let (stream1, stream2) = get_tcp_stream_pair().await;
         let mux1 = Mux::new(stream1, MuxConfig::default());
         let mux2 = Mux::new(stream2, MuxConfig::default());
-        let _t1 = smol::spawn(async move {
+        let t = smol::spawn(async move {
             for _ in 0..HANDSHAKE_ROUND {
                 let mut stream = mux1.accept().await.unwrap();
                 stream.close().await.unwrap();
@@ -94,6 +96,7 @@ fn smux_handshake() {
             let mut stream = mux2.connect().await.unwrap();
             stream.close().await.unwrap();
         }
+        t.await;
     });
 }
 
@@ -102,6 +105,14 @@ pub fn throughput_benchmark(c: &mut Criterion) {
     let mut group = c.benchmark_group("throughput");
     group.throughput(Throughput::Bytes((PAYLOAD_SIZE * SEND_ROUND) as u64));
     group.bench_function("smux", |b| b.iter(|| smux_throughput()));
+    {
+        let guard = pprof::ProfilerGuard::new(1000).unwrap();
+        group.bench_function("smux-profiling", |b| b.iter(|| smux_throughput()));
+        if let Ok(report) = guard.report().build() {
+            let file = File::create("throughput.svg").unwrap();
+            report.flamegraph(file).unwrap();
+        };
+    }
     group.bench_function("tcp", |b| b.iter(|| tcp_throughput()));
     group.finish();
 }
@@ -121,9 +132,9 @@ criterion_group! {
 }
 
 criterion_group! {
-    name = handhsake_benches;
+    name = handshake_benches;
     config = Criterion::default().sample_size(10);
     targets = handshake_benchmark
 }
 
-criterion_main!(throughput_benches, handhsake_benches);
+criterion_main!(handshake_benches, throughput_benches);
