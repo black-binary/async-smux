@@ -6,7 +6,7 @@ A lightweight asynchronous [smux](https://github.com/xtaci/smux) (Simple MUltipl
 
 ![img](https://raw.githubusercontent.com/xtaci/smux/master/mux.jpg)
 
-`async-smux` consumes a struct implementing `AsyncRead + AsyncWrite + Unpin + Send`, like TcpStream and TlsStream. And then you may spawn multiple `MuxStream`s (up to 4294967295) over it, which also implements `AsyncRead + AsyncWrite + Unpin + Send`.
+`async-smux` consumes a struct implementing `AsyncRead + AsyncWrite + Unpin + Send`, like `TcpStream` and `TlsStream`, to create a `Mux<T>` struct. And then you may spawn multiple `MuxStream<T>`s (up to 4294967295) over `Mux<T>`, which also implements `AsyncRead + AsyncWrite + Unpin + Send`.
 
 ## Benchmark
 
@@ -21,11 +21,27 @@ Run `cargo bench` to test it by yourself. Check out `/benches` directory for mor
 
 ## Laziness
 
-No thread or task will be spawned by this library. It just spawns a few `future`s. So it's runtime-independent.
+No thread or task will be spawned by this library. It just spawns a few `future`s. So it's totally runtime-independent.
 
 `Mux` and `MuxStream` are completely lazy and will DO NOTHING if you don't `poll()` them.
 
 Any polling operation, including `.read()` ,`.write()`, `accept()` and `connect()`, will push `Mux` and `MuxStream` working.
+
+## Specification
+
+```text
+VERSION(1B) | CMD(1B) | LENGTH(2B) | STREAMID(4B) | DATA(LENGTH)
+
+VERSION: 1
+
+CMD:
+    SYN(0)
+    FIN(1)
+    PSH(2)
+    NOP(3)
+
+STREAMID: Randomly chosen number
+```
 
 ## Example
 
