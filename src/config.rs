@@ -5,16 +5,16 @@ use std::io::{Error, ErrorKind};
 /// `Mux` Configurations
 #[derive(Copy, Clone)]
 pub struct MuxConfig {
-    /// Maximum payload size of each smux frame
+    /// Maximum payload size of each smux frame.
     pub max_payload_size: usize,
 
-    /// The buffer size for reading frames
+    /// The buffer size for reading frames.
     pub frame_buffer_size: usize,
 
-    /// The buffer size for accepting new `MuxStream`
+    /// The buffer size for accepting new `MuxStream`s.
     pub stream_buffer_size: usize,
 
-    /// Trying to clean dropped `MuxStream` records every `clean_duration` seconds
+    /// Trying to clean dropped `MuxStream` records every `clean_duration` seconds.
     pub clean_duration: u64,
 }
 
@@ -35,13 +35,25 @@ impl MuxConfig {
         if self.max_payload_size == 0 {
             return Err(Error::new(
                 ErrorKind::InvalidData,
-                "max_payload_length == 0",
+                "max_payload_size must be positive",
             ));
         }
         if self.max_payload_size > frame::MAX_PAYLOAD_SIZE {
             return Err(Error::new(
                 ErrorKind::InvalidData,
-                "max_frame_length > 0xffff",
+                "max_payload_size must not be larger than 65535",
+            ));
+        }
+        if self.frame_buffer_size == 0 {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "frame_buffer_size must be positive",
+            ));
+        }
+        if self.stream_buffer_size == 0 {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "frame_buffer_size must be positive",
             ));
         }
         Ok(())

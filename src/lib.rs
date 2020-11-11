@@ -1,4 +1,4 @@
-//! A lightweight asynchronous [smux](https://github.com/xtaci/smux) (Simple MUltipleXing) library for smol/async-std and any async runtime compatible to `futures`
+//! A lightweight asynchronous [smux](https://github.com/xtaci/smux) (Simple MUltipleXing) library for smol, async-std and any async runtime compatible to `futures`.
 
 pub(crate) mod config;
 pub(crate) mod error;

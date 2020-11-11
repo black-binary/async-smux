@@ -42,7 +42,12 @@ pub struct Mux<T> {
 }
 
 impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> Mux<T> {
-    /// Cleans dropped `MuxStream` immediately.
+    /// Gets the number of currently established `MuxStream`s.
+    pub async fn stream_count(&self) -> usize {
+        self.mux_future_generator.stream_meta.lock().await.len()
+    }
+
+    /// Cleans all dropped `MuxStream`s immediately.
     pub async fn clean(&self) -> crate::Result<()> {
         self.mux_future_generator.force_clean().await
     }
@@ -60,8 +65,7 @@ impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> Mux<T> {
     /// Creates a new `Mux`
     ///
     /// # Panic
-    /// Panics if the config is not valid.
-    ///
+    /// Panics if the config is not valid. Call `MuxConfig::check()` to make sure the config is valid.
     pub fn new(inner: T, config: MuxConfig) -> Self {
         let (accept_stream_tx, accept_stream_rx) = bounded(config.stream_buffer_size);
         let (reader, writer) = inner.split();
@@ -198,7 +202,13 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> MuxFutureGenerator<T> {
         let frame_writer = self.frame_writer.clone();
         Box::pin(async move {
             self.clean().await?;
-            let stream_id = rand::random();
+            let mut stream_id = rand::random();
+            {
+                let stream_meta = self.stream_meta.lock().await;
+                while stream_meta.contains_key(&stream_id) {
+                    stream_id = rand::random();
+                }
+            }
             let frame = Frame::new_sync_frame(stream_id);
             let stream = self.insert_connect_stream(stream_id).await;
             let mut frame_writer = frame_writer.lock().await;
@@ -218,7 +228,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> MuxFutureGenerator<T> {
                     let stream_id = accept_stream_rx
                         .recv()
                         .await
-                        .map_err(|_| Error::DispatcherClosed)?;
+                        .map_err(|_| Error::MuxClosed)?;
                     Ok(this.obtain_accept_stream(stream_id).await)
                 }
             };
@@ -245,7 +255,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> MuxFutureGenerator<T> {
                                 if let Some(m) = stream_meta.get_mut(&frame.header.stream_id) {
                                     m.frame_tx.clone()
                                 } else {
-                                    return Err(Error::StreamClosed(stream_id));
+                                    return Err(Error::MuxStreamClosed(stream_id));
                                 }
                             };
                             let stream_id = frame.header.stream_id;
@@ -290,13 +300,13 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> FrameFutureGenerator<T>
                             if let Some(m) = stream_meta.get(&stream_id) {
                                 m.frame_rx.clone()
                             } else {
-                                return Err(Error::StreamClosed(stream_id));
+                                return Err(Error::MuxStreamClosed(stream_id));
                             }
                         };
                         let frame = frame_rx
                             .recv()
                             .await
-                            .map_err(|_| Error::StreamClosed(stream_id))?;
+                            .map_err(|_| Error::MuxStreamClosed(stream_id))?;
                         assert_eq!(frame.header.stream_id, stream_id);
                         assert_eq!(frame.header.command, Command::Push);
                         Ok(frame)
@@ -327,7 +337,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> FrameFutureGenerator<T>
                             accept_stream_tx
                                 .send(frame.header.stream_id)
                                 .await
-                                .map_err(|_| Error::DispatcherClosed)?;
+                                .map_err(|_| Error::MuxClosed)?;
                             log::trace!("read sync packet {:X}", frame.header.stream_id);
                             continue;
                         }
@@ -411,11 +421,10 @@ enum CloseState {
 
 /// A virtual AsyncRead + AsyncWrite stream spawned by `Mux`.
 ///
-/// Async `read()` and `write()` method can read or write up to 65535 bytes. Use `read_exact()` and `write_exact()` to read or write huge payload instead.
+/// Async `read()` `write()` method can read or write at most 65535 bytes for each call. Use `read_exact()` and `write_exact()` to read or write huge payload instead.
 ///
 /// It's ok to drop `MuxStream` directly without calling `close()`. `Mux` will try to notify the remote side to close the virtual stream in the next `connect()` or `accept()` call.
 /// But it's still recommended to close the stream explicitly after using.
-///
 pub struct MuxStream<T> {
     stream_id: u32,
     future_generator: Arc<FrameFutureGenerator<T>>,
@@ -426,6 +435,13 @@ pub struct MuxStream<T> {
     _counter: Arc<()>,
 }
 
+impl<T> MuxStream<T> {
+    /// Gets the unique stream ID.
+    pub fn stream_id(&self) -> u32 {
+        self.stream_id
+    }
+}
+
 impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> AsyncRead for MuxStream<T> {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -433,7 +449,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> AsyncRead for MuxStream
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
         if let CloseState::Closed = self.close_state {
-            return Poll::Ready(Err(Error::StreamClosed(self.stream_id).into()));
+            return Poll::Ready(Err(Error::MuxStreamClosed(self.stream_id).into()));
         }
         loop {
             match self.read_state {
@@ -473,7 +489,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> AsyncWrite for MuxStrea
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         if let CloseState::Closed = self.close_state {
-            return Poll::Ready(Err(Error::StreamClosed(self.stream_id).into()));
+            return Poll::Ready(Err(Error::MuxStreamClosed(self.stream_id).into()));
         }
         loop {
             match self.write_state {

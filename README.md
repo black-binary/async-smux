@@ -6,7 +6,7 @@ A lightweight asynchronous [smux](https://github.com/xtaci/smux) (Simple MUltipl
 
 ![img](https://raw.githubusercontent.com/xtaci/smux/master/mux.jpg)
 
-async-smux consumes a struct implementing `AsyncRead + AsyncWrite + Unpin + Send`, like TcpStream and TlsStream. And then you may spawn multiple `MuxStream`s(up to 65535), which also implements `AsyncRead + AsyncWrite + Unpin + Send`.
+`async-smux` consumes a struct implementing `AsyncRead + AsyncWrite + Unpin + Send`, like TcpStream and TlsStream. And then you may spawn multiple `MuxStream`s (up to 4294967295) over it, which also implements `AsyncRead + AsyncWrite + Unpin + Send`.
 
 ## Benchmark
 

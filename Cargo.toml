@@ -1,8 +1,8 @@
 [package]
 name = "async_smux"
-version = "0.2.0"
+version = "0.2.1"
 authors = ["black-binary <blackbinary@qq.com>"]
-description = "Asynchronous smux library for smol / async-std"
+description = "Asynchronous smux multiplexing library"
 license = "MIT"
 edition = "2018"
 
