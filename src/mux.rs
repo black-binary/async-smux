@@ -1,714 +1,685 @@
 use std::{
-    cmp::min,
-    collections::HashMap,
-    io,
+    collections::{HashMap, VecDeque},
+    io::ErrorKind,
     pin::Pin,
-    sync::atomic::Ordering,
-    sync::{atomic::AtomicU64, Arc},
-    task::{Context, Poll},
-    time::SystemTime,
+    sync::Arc,
+    task::{Context, Poll, Waker},
 };
 
-use async_channel::{bounded, Receiver, Sender};
-use async_lock::Mutex;
 use bytes::{Buf, Bytes};
-use futures::{io::ReadHalf, io::WriteHalf, ready, AsyncRead, AsyncReadExt, AsyncWrite, Future};
-use futures_lite::FutureExt as LiteFutureExt;
+use futures::{
+    future::{select, Select},
+    ready, Future, FutureExt, SinkExt, Stream, StreamExt,
+};
+use futures_sink::Sink;
+use parking_lot::Mutex;
+use std::io as StdIo;
+use tokio::io::{self, AsyncRead, AsyncWrite};
+use tokio_util::codec::Framed;
 
 use crate::{
-    frame::{Command, Frame, FrameIo},
-    Error, MuxConfig,
+    error::{MuxError, MuxResult},
+    frame::{MuxCodec, MuxCommand, MuxFrame, MAX_PAYLOAD_SIZE},
 };
 
-type ReadFrameFuture = Pin<Box<dyn Future<Output = crate::Result<Frame>> + Send>>;
-type WriteFrameFuture = Pin<Box<dyn Future<Output = crate::Result<()>> + Send>>;
-type StreamFuture<T> = Pin<Box<dyn Future<Output = crate::Result<MuxStream<T>>> + Send>>;
+pub trait TokioConn: AsyncRead + AsyncWrite + Unpin {}
 
-fn now_sec() -> u64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
-}
+impl<T> TokioConn for T where T: AsyncRead + AsyncWrite + Unpin {}
 
-/// A multiplexer/demultiplexer for AsyncRead / AsyncWrite streams.
-///
-/// `Mux` can accept new `MuxStream` from the remote peer, or connect new `MuxStream` to the remote peer.
-/// Note that if the remote peer is trying to connect to the local `Mux`, while there is no task accepting the new `MuxStream` on the local side, the `Mux` and all related `MuxStream`s might get pended.
-///
-#[derive(Clone)]
-pub struct Mux<T> {
-    mux_future_generator: Arc<MuxFutureGenerator<T>>,
-}
-
-impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> Mux<T> {
-    /// Gets the number of currently established `MuxStream`s.
-    pub async fn stream_count(&self) -> usize {
-        self.mux_future_generator.stream_meta.lock().await.len()
-    }
-
-    /// Cleans all dropped `MuxStream`s immediately.
-    pub async fn clean(&self) -> crate::Result<()> {
-        self.mux_future_generator.force_clean().await
-    }
-
-    /// Accepts a new `MuxStream` from the remote peer.
-    pub async fn accept(&self) -> crate::Result<MuxStream<T>> {
-        self.mux_future_generator.clone().accept().await
-    }
-
-    /// Connects a new `MuxStream` to the remote peer.
-    pub async fn connect(&self) -> crate::Result<MuxStream<T>> {
-        self.mux_future_generator.clone().connect().await
-    }
-
-    /// Creates a new `Mux`
-    ///
-    /// # Panic
-    /// Panics if the config is not valid. Call `MuxConfig::check()` to make sure the config is valid.
-    pub fn new(inner: T, config: MuxConfig) -> Self {
-        let (accept_stream_tx, accept_stream_rx) = bounded(config.stream_buffer_size);
-        let (reader, writer) = inner.split();
-        let config = Arc::new(config);
-
-        let frame_reader = Arc::new(Mutex::new(FrameIo::new(reader)));
-        let frame_writer = Arc::new(Mutex::new(FrameIo::new(writer)));
-        let stream_meta = Arc::new(Mutex::new(HashMap::new()));
-
-        let frame_future_generator = Arc::new(FrameFutureGenerator {
-            stream_meta: stream_meta.clone(),
-            frame_writer: frame_writer.clone(),
-            frame_reader: frame_reader.clone(),
-            accept_stream_tx,
-            config: config.clone(),
-        });
-
-        let mux_future_generator = Arc::new(MuxFutureGenerator {
-            stream_meta: stream_meta.clone(),
-            accept_stream_rx,
-            frame_writer: frame_writer.clone(),
-            frame_reader: frame_reader.clone(),
-            frame_future_generator,
-            last_clean: Arc::new(AtomicU64::new(now_sec())),
-            config,
-        });
-
-        Self {
-            mux_future_generator,
-        }
-    }
-}
-
-struct Metadata {
-    frame_tx: Sender<Frame>,
-    frame_rx: Receiver<Frame>,
-    counter: Arc<()>,
-}
-
-impl Drop for Metadata {
-    fn drop(&mut self) {
-        self.frame_tx.close();
-        self.frame_rx.close();
-    }
-}
-
-struct MuxFutureGenerator<T> {
-    stream_meta: Arc<Mutex<HashMap<u32, Metadata>>>,
-    accept_stream_rx: Receiver<u32>,
-    frame_reader: Arc<Mutex<FrameIo<ReadHalf<T>>>>,
-    frame_writer: Arc<Mutex<FrameIo<WriteHalf<T>>>>,
-    frame_future_generator: Arc<FrameFutureGenerator<T>>,
-    last_clean: Arc<AtomicU64>,
-    config: Arc<MuxConfig>,
-}
-
-impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> MuxFutureGenerator<T> {
-    async fn obtain_accept_stream(&self, stream_id: u32) -> MuxStream<T> {
-        let counter = {
-            let stream_meta = self.stream_meta.lock().await;
-            stream_meta.get(&stream_id).unwrap().counter.clone()
-        };
-        let stream = MuxStream {
-            stream_id: stream_id,
-            read_state: ReadState::Idle,
-            write_state: WriteState::Idle,
-            close_state: CloseState::Idle,
-            future_generator: self.frame_future_generator.clone(),
-            max_payload_size: self.config.max_payload_size,
-            _counter: counter,
-        };
-        stream
-    }
-
-    async fn insert_connect_stream(&self, stream_id: u32) -> MuxStream<T> {
-        let (frame_tx, frame_rx) = bounded(self.config.frame_buffer_size);
-        let counter = Arc::new(());
-        {
-            let mut stream_meta = self.stream_meta.lock().await;
-            stream_meta.insert(
-                stream_id,
-                Metadata {
-                    frame_tx,
-                    frame_rx,
-                    counter: counter.clone(),
+pub fn mux_connection<T: TokioConn>(
+    connection: T,
+) -> (MuxConnector<T>, MuxAcceptor<T>, MuxWorker<T>) {
+    let inner = Framed::new(connection, MuxCodec {});
+    let state = Arc::new(Mutex::new(MuxState {
+        inner,
+        handles: HashMap::new(),
+        accept_queue: VecDeque::new(),
+        accept_waker: None,
+        accpet_closed: false,
+        tx_queue: VecDeque::new(),
+        tx_waker: None,
+        tx_closed: false,
+        rx_closed: false,
+    }));
+    (
+        MuxConnector {
+            state: state.clone(),
+        },
+        MuxAcceptor {
+            state: state.clone(),
+        },
+        MuxWorker {
+            select_fut: select(
+                MuxDispatcher {
+                    state: state.clone(),
                 },
-            );
-        }
+                MuxSender { state },
+            ),
+        },
+    )
+}
+
+pub struct MuxConnector<T: TokioConn> {
+    state: Arc<Mutex<MuxState<T>>>,
+}
+
+impl<T: TokioConn> MuxConnector<T> {
+    pub fn connect(&self) -> MuxResult<MuxStream<T>> {
+        let stream_id = rand::random();
+
+        let mut state = self.state.lock();
+        state.process_sync(stream_id)?;
+        let frame = MuxFrame::new(MuxCommand::Sync, stream_id, Bytes::new());
+        state.enqueue_frame_global(frame);
+        state.notify_tx();
+
         let stream = MuxStream {
-            stream_id: stream_id,
-            read_state: ReadState::Idle,
-            write_state: WriteState::Idle,
-            close_state: CloseState::Idle,
-            future_generator: self.frame_future_generator.clone(),
-            max_payload_size: self.config.max_payload_size,
-            _counter: counter,
+            stream_id,
+            state: self.state.clone(),
+            read_buffer: None,
         };
-        stream
-    }
-
-    async fn remove_stream(&self, stream_id: u32) {
-        let mut stream_meta = self.stream_meta.lock().await;
-        stream_meta.remove(&stream_id);
-    }
-
-    async fn force_clean(&self) -> crate::Result<()> {
-        let mut dead = Vec::new();
-        {
-            let stream_meta = self.stream_meta.lock().await;
-            for (id, m) in stream_meta.iter() {
-                if std::sync::Arc::<()>::strong_count(&m.counter) == 1 {
-                    dead.push(*id)
-                }
-            }
-        }
-        for id in dead.iter() {
-            let frame = Frame::new_finish_frame(*id);
-            self.frame_future_generator.write_frame(&frame).await?;
-        }
-        self.last_clean.store(now_sec(), Ordering::Relaxed);
-        Ok(())
-    }
-
-    async fn clean(&self) -> crate::Result<()> {
-        let now = now_sec();
-        let duration = self.config.clean_duration;
-        if now - self.last_clean.load(Ordering::Relaxed) > duration {
-            self.force_clean().await?;
-        }
-        Ok(())
-    }
-
-    fn connect(self: Arc<Self>) -> StreamFuture<T> {
-        let frame_writer = self.frame_writer.clone();
-        Box::pin(async move {
-            self.clean().await?;
-            let mut stream_id = rand::random();
-            {
-                let stream_meta = self.stream_meta.lock().await;
-                while stream_meta.contains_key(&stream_id) {
-                    stream_id = rand::random();
-                }
-            }
-            let frame = Frame::new_sync_frame(stream_id);
-            let stream = self.insert_connect_stream(stream_id).await;
-            let mut frame_writer = frame_writer.lock().await;
-            frame_writer.write_frame(&frame).await?;
-            Ok(stream)
-        })
-    }
-
-    fn accept(self: Arc<Self>) -> StreamFuture<T> {
-        let frame_reader = self.frame_reader.clone();
-        let stream_meta = self.stream_meta.clone();
-        let accept_stream_rx = self.accept_stream_rx.clone();
-        Box::pin(async move {
-            let channel_fut = {
-                let this = self.clone();
-                async move {
-                    let stream_id = accept_stream_rx
-                        .recv()
-                        .await
-                        .map_err(|_| Error::MuxClosed)?;
-                    Ok(this.obtain_accept_stream(stream_id).await)
-                }
-            };
-
-            let loop_fut = async move {
-                self.clean().await?;
-                let mut frame_reader_guard = frame_reader.lock().await;
-                loop {
-                    let frame = frame_reader_guard.read_frame().await?;
-
-                    match frame.header.command {
-                        Command::Sync => {
-                            return Ok(self.insert_connect_stream(frame.header.stream_id).await);
-                        }
-                        Command::Finish => {
-                            self.remove_stream(frame.header.stream_id).await;
-                            log::trace!("read finish packet {:X}", frame.header.stream_id);
-                            continue;
-                        }
-                        Command::Push => {
-                            let stream_id = frame.header.stream_id;
-                            let frame_tx = {
-                                let mut stream_meta = stream_meta.lock().await;
-                                if let Some(m) = stream_meta.get_mut(&frame.header.stream_id) {
-                                    m.frame_tx.clone()
-                                } else {
-                                    return Err(Error::MuxStreamClosed(stream_id));
-                                }
-                            };
-                            let stream_id = frame.header.stream_id;
-                            if frame_tx.send(frame).await.is_err() {
-                                let mut stream_meta = stream_meta.lock().await;
-                                stream_meta.remove(&stream_id);
-                                log::error!("push frame to closed stream {:X}", stream_id);
-                            }
-                        }
-                        Command::Nop => {
-                            // TODO update timestamp
-                        }
-                    }
-                }
-            };
-            loop_fut.race(channel_fut).await
-        })
+        Ok(stream)
     }
 }
 
-struct FrameFutureGenerator<T> {
-    stream_meta: Arc<Mutex<HashMap<u32, Metadata>>>,
-    accept_stream_tx: Sender<u32>,
-    frame_reader: Arc<Mutex<FrameIo<ReadHalf<T>>>>,
-    frame_writer: Arc<Mutex<FrameIo<WriteHalf<T>>>>,
-    config: Arc<MuxConfig>,
+pub struct MuxAcceptor<T: TokioConn> {
+    state: Arc<Mutex<MuxState<T>>>,
 }
 
-impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> FrameFutureGenerator<T> {
-    fn read_frame(&self, stream_id: u32) -> ReadFrameFuture {
-        let stream_meta = self.stream_meta.clone();
-        let accept_stream_tx = self.accept_stream_tx.clone();
-        let frame_reader = self.frame_reader.clone();
-        let frame_buffer_size = self.config.frame_buffer_size;
-        Box::pin(async move {
-            let channel_fut = {
-                let stream_meta = stream_meta.clone();
-                async move {
-                    {
-                        let frame_rx = {
-                            let stream_meta = stream_meta.lock().await;
-                            if let Some(m) = stream_meta.get(&stream_id) {
-                                m.frame_rx.clone()
-                            } else {
-                                return Err(Error::MuxStreamClosed(stream_id));
-                            }
-                        };
-                        let frame = frame_rx
-                            .recv()
-                            .await
-                            .map_err(|_| Error::MuxStreamClosed(stream_id))?;
-                        assert_eq!(frame.header.stream_id, stream_id);
-                        assert_eq!(frame.header.command, Command::Push);
-                        Ok(frame)
-                    }
-                }
-            };
-
-            let loop_fut = async move {
-                // Keep locking the reader
-                let mut frame_reader_guard = frame_reader.lock().await;
-                loop {
-                    let frame = frame_reader_guard.read_frame().await?;
-                    log::trace!("read {:?}", frame);
-                    match frame.header.command {
-                        Command::Sync => {
-                            let (frame_tx, frame_rx) = bounded(frame_buffer_size);
-                            {
-                                let mut stream_meta = stream_meta.lock().await;
-                                stream_meta.insert(
-                                    frame.header.stream_id,
-                                    Metadata {
-                                        frame_tx,
-                                        frame_rx,
-                                        counter: Arc::new(()),
-                                    },
-                                );
-                            }
-                            accept_stream_tx
-                                .send(frame.header.stream_id)
-                                .await
-                                .map_err(|_| Error::MuxClosed)?;
-                            log::trace!("read sync packet {:X}", frame.header.stream_id);
-                            continue;
-                        }
-                        Command::Finish => {
-                            let mut stream_meta = stream_meta.lock().await;
-                            stream_meta.remove(&frame.header.stream_id);
-                            log::trace!("read finish packet {:X}", frame.header.stream_id);
-                            continue;
-                        }
-                        Command::Push => {
-                            if frame.header.stream_id == stream_id {
-                                return Ok(frame);
-                            }
-                            let frame_tx = {
-                                let mut stream_meta = stream_meta.lock().await;
-                                if let Some(m) = stream_meta.get_mut(&frame.header.stream_id) {
-                                    m.frame_tx.clone()
-                                } else {
-                                    debug_assert!(false);
-                                    log::error!("stream closed: {}", stream_id);
-                                    continue;
-                                }
-                            };
-                            let stream_id = frame.header.stream_id;
-                            if frame_tx.send(frame).await.is_err() {
-                                let mut stream_meta = stream_meta.lock().await;
-                                stream_meta.remove(&stream_id);
-                                log::error!("push frame to closed stream {:X}", stream_id);
-                            }
-                        }
-                        Command::Nop => {
-                            // TODO update timestamp
-                        }
-                    }
-                }
-            };
-            loop_fut.race(channel_fut).await
-        })
+impl<T: TokioConn> Drop for MuxAcceptor<T> {
+    fn drop(&mut self) {
+        self.state.lock().accpet_closed = true;
     }
+}
 
-    fn write_frame(&self, frame: &Frame) -> WriteFrameFuture {
-        let stream_meta = self.stream_meta.clone();
-        let frame_writer = self.frame_writer.clone();
-        let frame = frame.clone();
-        Box::pin(async move {
-            log::trace!("write {:?}", frame);
+impl<T: TokioConn> Stream for MuxAcceptor<T> {
+    type Item = MuxStream<T>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let mut state = self.state.lock();
+
+        if let Some(stream) = state.accept_queue.pop_front() {
+            Poll::Ready(Some(stream))
+        } else {
+            state.accept_waker = Some(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+}
+
+impl<T: TokioConn> MuxAcceptor<T> {
+    pub async fn accept(&mut self) -> Option<MuxStream<T>> {
+        self.next().await
+    }
+}
+
+struct MuxSender<T: TokioConn> {
+    state: Arc<Mutex<MuxState<T>>>,
+}
+impl<T: TokioConn> Future for MuxSender<T> {
+    type Output = MuxResult<()>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        loop {
+            let mut state = self.state.lock();
+            ready!(state.poll_ready_tx(cx))?;
+            ready!(state.poll_flush_frames(cx))?;
+            ready!(state.poll_flush_inner(cx))?;
+        }
+    }
+}
+
+pub struct MuxDispatcher<T: TokioConn> {
+    state: Arc<Mutex<MuxState<T>>>,
+}
+
+impl<T: TokioConn> Future for MuxDispatcher<T> {
+    type Output = MuxResult<()>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        loop {
+            let mut state = self.state.lock();
+            if state.rx_closed {
+                return Poll::Ready(Ok(()));
+            }
+
+            let frame = ready!(state.poll_next_frame(cx))?;
             match frame.header.command {
-                Command::Sync => {
-                    log::trace!("spawning new connect stream");
+                MuxCommand::Sync => {
+                    if state.accpet_closed {
+                        state.send_finish(frame.header.stream_id);
+                        continue;
+                    }
+
+                    if state.process_sync(frame.header.stream_id).is_err() {
+                        // Duplicated
+                        state.send_finish(frame.header.stream_id);
+                        continue;
+                    }
+
+                    let stream = MuxStream {
+                        stream_id: frame.header.stream_id,
+                        state: self.state.clone(),
+                        read_buffer: None,
+                    };
+                    state.accept_queue.push_back(stream);
+                    if let Some(waker) = state.accept_waker.take() {
+                        waker.wake();
+                    }
                 }
-                Command::Finish => {
-                    let mut stream_meta = stream_meta.lock().await;
-                    stream_meta.remove(&frame.header.stream_id);
+                MuxCommand::Finish => {
+                    state.process_finish(frame.header.stream_id);
                 }
-                Command::Push => {}
-                Command::Nop => {}
+                MuxCommand::Push => {
+                    let stream_id = frame.header.stream_id;
+                    if !state.process_push(frame) {
+                        state.send_finish(stream_id);
+                    }
+                }
+                MuxCommand::Nop => {
+                    // Do nothing
+                }
             }
-            let mut frame_writer = frame_writer.lock().await;
-            frame_writer.write_frame(&frame).await?;
-            Ok(())
-        })
+        }
     }
 }
 
-enum ReadState {
-    Idle,
-    Reading(Bytes),
-    Polling(ReadFrameFuture),
+pub struct MuxWorker<T: TokioConn> {
+    select_fut: Select<MuxDispatcher<T>, MuxSender<T>>,
 }
 
-enum WriteState {
-    Idle,
-    Polling(WriteFrameFuture, usize),
+impl<T: TokioConn> Future for MuxWorker<T> {
+    type Output = MuxResult<()>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let (res, _) = ready!(self.select_fut.poll_unpin(cx)).factor_first();
+        Poll::Ready(res)
+    }
 }
 
-enum CloseState {
-    Idle,
-    Polling(WriteFrameFuture),
-    Closed,
-}
-
-/// A virtual AsyncRead + AsyncWrite stream spawned by `Mux`.
-///
-/// Async `read()` `write()` method can read or write at most 65535 bytes for each call. Use `read_exact()` and `write_exact()` to read or write huge payload instead.
-///
-/// It's ok to drop `MuxStream` directly without calling `close()`. `Mux` will try to notify the remote side to close the virtual stream in the next `connect()` or `accept()` call.
-/// But it's still recommended to close the stream explicitly after using.
-pub struct MuxStream<T> {
+pub struct MuxStream<T: TokioConn> {
     stream_id: u32,
-    future_generator: Arc<FrameFutureGenerator<T>>,
-    read_state: ReadState,
-    write_state: WriteState,
-    close_state: CloseState,
-    max_payload_size: usize,
-    _counter: Arc<()>,
+    state: Arc<Mutex<MuxState<T>>>,
+
+    read_buffer: Option<Bytes>,
 }
 
-impl<T> MuxStream<T> {
-    /// Gets the unique stream ID.
-    pub fn stream_id(&self) -> u32 {
-        self.stream_id
+impl<T: TokioConn> Drop for MuxStream<T> {
+    fn drop(&mut self) {
+        let mut state = self.state.lock();
+        if state.is_open(self.stream_id) {
+            // The user did not call `shutdown()`
+            state.enqueue_frame_global(MuxFrame::new(
+                MuxCommand::Finish,
+                self.stream_id,
+                Bytes::new(),
+            ));
+            state.notify_tx();
+        }
+        state.remove_stream(self.stream_id);
     }
 }
 
-impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> AsyncRead for MuxStream<T> {
+impl<T: TokioConn> AsyncRead for MuxStream<T> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        buf: &mut [u8],
-    ) -> Poll<io::Result<usize>> {
-        if let CloseState::Closed = self.close_state {
-            return Poll::Ready(Err(Error::MuxStreamClosed(self.stream_id).into()));
-        }
+        buf: &mut io::ReadBuf<'_>,
+    ) -> Poll<StdIo::Result<()>> {
         loop {
-            match self.read_state {
-                ReadState::Idle => {
-                    let fut = self.future_generator.read_frame(self.stream_id);
-                    self.read_state = ReadState::Polling(fut);
-                    continue;
+            if let Some(read_buffer) = &mut self.read_buffer {
+                if read_buffer.len() <= buf.remaining() {
+                    buf.put_slice(read_buffer);
+                    self.read_buffer = None;
+                } else {
+                    let len = buf.remaining();
+                    buf.put_slice(&read_buffer[..len]);
+                    read_buffer.advance(len);
                 }
-                ReadState::Polling(ref mut fut) => {
-                    let frame = ready!(fut.as_mut().poll(cx)).map_err(|e| {
-                        self.close_state = CloseState::Closed;
-                        e
-                    })?;
-                    self.read_state = ReadState::Reading(frame.get_payload());
-                    continue;
-                }
-                ReadState::Reading(ref mut payload) => {
-                    if payload.len() > buf.len() {
-                        payload.copy_to_slice(&mut buf[..]);
-                        return Poll::Ready(Ok(buf.len()));
-                    } else {
-                        let len = payload.len();
-                        buf[..len].copy_from_slice(&payload);
-                        self.read_state = ReadState::Idle;
-                        return Poll::Ready(Ok(len));
-                    }
-                }
+                return Poll::Ready(Ok(()));
+            }
+
+            let r = ready!(self.state.lock().poll_read_data(cx, self.stream_id));
+            if let Some(frame) = r {
+                debug_assert_eq!(frame.header.command, MuxCommand::Push);
+                self.read_buffer = Some(frame.payload);
+            } else {
+                return Poll::Ready(Err(StdIo::Error::new(
+                    ErrorKind::ConnectionReset,
+                    format!("No such stream id: {:x}", self.stream_id),
+                )));
             }
         }
     }
 }
 
-impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> AsyncWrite for MuxStream<T> {
+fn mux_to_io_err(e: MuxError) -> StdIo::Error {
+    StdIo::Error::new(ErrorKind::ConnectionReset, e)
+}
+
+impl<T: TokioConn> AsyncWrite for MuxStream<T> {
     fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
         buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        if let CloseState::Closed = self.close_state {
-            return Poll::Ready(Err(Error::MuxStreamClosed(self.stream_id).into()));
+    ) -> Poll<Result<usize, StdIo::Error>> {
+        let state = self.state.clone();
+        let mut state = state.lock();
+        if !state.is_open(self.stream_id) {
+            return Poll::Ready(Err(StdIo::ErrorKind::ConnectionReset.into()));
         }
+
+        let mut write_buffer = Bytes::copy_from_slice(buf);
+        while !write_buffer.is_empty() {
+            let len = write_buffer.len().min(MAX_PAYLOAD_SIZE);
+            let payload = write_buffer.split_to(len);
+            let frame = MuxFrame::new(MuxCommand::Push, self.stream_id, payload);
+            state.enqueue_frame_stream(self.stream_id, frame);
+        }
+        state.notify_tx();
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), StdIo::Error>> {
+        let mut state = self.state.lock();
+        if !state.is_open(self.stream_id) {
+            return Poll::Ready(Err(StdIo::Error::new(
+                ErrorKind::ConnectionReset,
+                "stream is already closed",
+            )));
+        }
+
+        state
+            .poll_flush_stream_frames(cx, self.stream_id)
+            .map_err(mux_to_io_err)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), StdIo::Error>> {
         loop {
-            match self.write_state {
-                WriteState::Idle => {
-                    let len = min(buf.len(), self.max_payload_size);
-                    let frame = Frame::new_push_frame(self.stream_id, &buf[..len]);
-                    let fut = self.future_generator.write_frame(&frame);
-                    self.write_state = WriteState::Polling(fut, len);
-                    continue;
-                }
-                WriteState::Polling(ref mut fut, len) => {
-                    ready!(fut.as_mut().poll(cx)).map_err(|e| {
-                        self.close_state = CloseState::Closed;
-                        e
-                    })?;
-                    self.write_state = WriteState::Idle;
-                    return Poll::Ready(Ok(len));
-                }
+            let mut state = self.state.lock();
+            ready!(state
+                .poll_flush_stream_frames(cx, self.stream_id)
+                .map_err(mux_to_io_err))?;
+            if !state.is_open(self.stream_id) {
+                return Poll::Ready(Ok(()));
             }
+
+            state.process_finish(self.stream_id);
+            let frame = MuxFrame::new(MuxCommand::Finish, self.stream_id, Bytes::new());
+            state.enqueue_frame_stream(self.stream_id, frame);
+            state.notify_tx();
+        }
+    }
+}
+
+struct StreamHandle {
+    closed: bool,
+
+    tx_queue: VecDeque<MuxFrame>,
+    tx_waker: Option<Waker>,
+
+    rx_queue: VecDeque<MuxFrame>,
+    rx_waker: Option<Waker>,
+}
+
+impl StreamHandle {
+    #[inline]
+    fn wake_rx(&mut self) {
+        if let Some(waker) = self.rx_waker.take() {
+            waker.wake();
         }
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if let WriteState::Polling(ref mut fut, _) = self.write_state {
-            ready!(fut.as_mut().poll(cx))?;
+    #[inline]
+    fn wake_tx(&mut self) {
+        if let Some(waker) = self.tx_waker.take() {
+            waker.wake();
         }
+    }
+}
+
+struct MuxState<T: TokioConn> {
+    inner: Framed<T, MuxCodec>,
+    handles: HashMap<u32, StreamHandle>,
+
+    accept_queue: VecDeque<MuxStream<T>>,
+    accept_waker: Option<Waker>,
+    accpet_closed: bool,
+
+    tx_queue: VecDeque<MuxFrame>,
+    tx_waker: Option<Waker>,
+
+    tx_closed: bool,
+    rx_closed: bool,
+}
+
+impl<T: TokioConn> MuxState<T> {
+    fn remove_stream(&mut self, stream_id: u32) {
+        self.handles
+            .remove(&stream_id)
+            .expect("Failed to remove stream");
+    }
+
+    fn send_finish(&mut self, stream_id: u32) {
+        self.enqueue_frame_global(MuxFrame::new(MuxCommand::Finish, stream_id, Bytes::new()));
+        self.notify_tx();
+    }
+
+    fn process_sync(&mut self, stream_id: u32) -> MuxResult<()> {
+        if self.handles.contains_key(&stream_id) {
+            return Err(MuxError::DuplicatedStreamId(stream_id));
+        }
+
+        let handle = StreamHandle {
+            closed: false,
+
+            tx_queue: VecDeque::with_capacity(128),
+            tx_waker: None,
+
+            rx_queue: VecDeque::with_capacity(128),
+            rx_waker: None,
+        };
+        self.handles.insert(stream_id, handle);
+        Ok(())
+    }
+
+    fn process_finish(&mut self, stream_id: u32) {
+        if let Some(handle) = self.handles.get_mut(&stream_id) {
+            handle.closed = true;
+            handle.wake_tx();
+            handle.wake_rx();
+        }
+    }
+
+    fn process_push(&mut self, frame: MuxFrame) -> bool {
+        if let Some(handle) = self.handles.get_mut(&frame.header.stream_id) {
+            handle.rx_queue.push_back(frame);
+            handle.wake_rx();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn is_open(&self, stream_id: u32) -> bool {
+        if let Some(handle) = self.handles.get(&stream_id) {
+            !handle.closed
+        } else {
+            false
+        }
+    }
+
+    fn poll_next_frame(&mut self, cx: &mut Context<'_>) -> Poll<MuxResult<MuxFrame>> {
+        if self.rx_closed {
+            return Poll::Ready(Err(MuxError::ConnectionClosed));
+        }
+
+        if let Some(r) = ready!(self.inner.poll_next_unpin(cx)) {
+            let frame = r.map_err(|e| {
+                self.rx_closed = true;
+                e
+            })?;
+            Poll::Ready(Ok(frame))
+        } else {
+            self.rx_closed = true;
+            Poll::Ready(Err(MuxError::ConnectionClosed))
+        }
+    }
+
+    #[inline]
+    fn pin_inner(&mut self) -> Pin<&mut Framed<T, MuxCodec>> {
+        Pin::new(&mut self.inner)
+    }
+
+    fn poll_write_ready(&mut self, cx: &mut Context<'_>) -> Poll<MuxResult<()>> {
+        ready!(self.pin_inner().poll_ready(cx)).map_err(|e| {
+            self.tx_closed = true;
+            e
+        })?;
         Poll::Ready(Ok(()))
     }
 
-    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        loop {
-            match self.close_state {
-                CloseState::Idle => {
-                    let frame = Frame::new_finish_frame(self.stream_id);
-                    let fut = self.future_generator.write_frame(&frame);
-                    self.close_state = CloseState::Polling(fut);
-                    continue;
-                }
-                CloseState::Polling(ref mut fut) => {
-                    ready!(fut.as_mut().poll(cx))?;
-                    self.close_state = CloseState::Closed;
-                    return Poll::Ready(Ok(()));
-                }
-                CloseState::Closed => return Poll::Ready(Ok(())),
+    fn write_frame(&mut self, frame: MuxFrame) -> MuxResult<()> {
+        self.pin_inner().start_send(frame)?;
+        Ok(())
+    }
+
+    fn poll_read_data(&mut self, cx: &mut Context<'_>, stream_id: u32) -> Poll<Option<MuxFrame>> {
+        if let Some(handle) = self.handles.get_mut(&stream_id) {
+            if let Some(f) = handle.rx_queue.pop_front() {
+                Poll::Ready(Some(f))
+            } else if handle.closed {
+                Poll::Ready(None)
+            } else {
+                handle.rx_waker = Some(cx.waker().clone());
+                Poll::Pending
             }
+        } else {
+            Poll::Ready(None)
+        }
+    }
+
+    fn enqueue_frame_stream(&mut self, stream_id: u32, frame: MuxFrame) {
+        self.handles
+            .get_mut(&stream_id)
+            .unwrap()
+            .tx_queue
+            .push_back(frame)
+    }
+
+    fn enqueue_frame_global(&mut self, frame: MuxFrame) {
+        self.tx_queue.push_back(frame);
+    }
+
+    fn notify_tx(&mut self) {
+        if let Some(waker) = self.tx_waker.take() {
+            waker.wake();
+        }
+    }
+
+    fn poll_flush_stream_frames(
+        &mut self,
+        cx: &mut Context<'_>,
+        stream_id: u32,
+    ) -> Poll<MuxResult<()>> {
+        let handle = self.handles.get_mut(&stream_id).unwrap();
+        if handle.tx_queue.is_empty() {
+            Poll::Ready(Ok(()))
+        } else {
+            handle.tx_waker = Some(cx.waker().clone());
+            self.notify_tx();
+            Poll::Pending
+        }
+    }
+
+    fn poll_flush_frames(&mut self, cx: &mut Context<'_>) -> Poll<MuxResult<()>> {
+        // Global
+        while !self.tx_queue.is_empty() {
+            ready!(self.poll_write_ready(cx))?;
+            let frame = self.tx_queue.pop_front().unwrap();
+            self.write_frame(frame)?;
+        }
+
+        // Streams
+        for (_, h) in self
+            .handles
+            .iter_mut()
+            .filter(|(_, h)| !h.tx_queue.is_empty())
+        {
+            while !h.tx_queue.is_empty() {
+                ready!(Pin::new(&mut self.inner).poll_ready(cx))?;
+                Pin::new(&mut self.inner).start_send(h.tx_queue.pop_front().unwrap())?;
+            }
+            h.wake_tx();
+        }
+
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_flush_inner(&mut self, cx: &mut Context<'_>) -> Poll<MuxResult<()>> {
+        self.inner.poll_flush_unpin(cx)
+    }
+
+    fn poll_ready_tx(&mut self, cx: &mut Context<'_>) -> Poll<MuxResult<()>> {
+        if self.tx_closed {
+            return Poll::Ready(Err(MuxError::ConnectionClosed));
+        }
+
+        if self.tx_queue.is_empty() && self.handles.iter().all(|(_, h)| h.tx_queue.is_empty()) {
+            self.tx_waker = Some(cx.waker().clone());
+            Poll::Pending
+        } else {
+            Poll::Ready(Ok(()))
         }
     }
 }
 
 #[cfg(test)]
-mod test {
-    use async_channel::bounded;
-    use futures::{AsyncWriteExt, StreamExt};
-    use log::LevelFilter;
-    use rand::prelude::*;
-    use smol::net::{TcpListener, TcpStream};
+mod tests {
+    use std::time::Duration;
 
-    use super::*;
+    use rand::RngCore;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+    };
 
-    fn init() {
-        let _ = env_logger::builder()
-            .filter_level(LevelFilter::Info)
-            .try_init();
-        std::env::set_var("SMOL_THREADS", "16");
-    }
+    use crate::{frame::MAX_PAYLOAD_SIZE, mux::TokioConn, mux_connection, MuxStream};
 
-    async fn get_tcp_stream_pair() -> (TcpStream, TcpStream) {
+    async fn get_tcp_pair() -> (TcpStream, TcpStream) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let local_addr = listener.local_addr().unwrap();
-        let (tx, rx) = bounded(1);
-        smol::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            tx.send(stream).await.unwrap();
-        })
-        .detach();
-        let client_stream = TcpStream::connect(local_addr).await.unwrap();
-        let server_stream = rx.recv().await.unwrap();
-        (client_stream, server_stream)
-    }
-
-    #[test]
-    fn connect_accept() {
-        init();
-        smol::block_on(async move {
-            let (a, b) = get_tcp_stream_pair().await;
-            let t = smol::spawn(async move {
-                let mux_a = Mux::new(a, MuxConfig::default());
-                let mut a = mux_a.connect().await.unwrap();
-                a.write_all(b"hello1").await.unwrap();
-                let mut buf = [0u8; 0x100];
-                a.read(&mut buf).await.unwrap();
-            });
-            let mux_b = Mux::new(b, MuxConfig::default());
-            let mut b = mux_b.accept().await.unwrap();
-            let mut buf = [0u8; 0x100];
-            let size = b.read(&mut buf).await.unwrap();
-            log::debug!("{:?}", &buf[..size]);
-            b.write_all(b"hello2").await.unwrap();
-            t.await;
+        let addr = listener.local_addr().unwrap();
+        let h = tokio::spawn(async move {
+            let (a, _) = listener.accept().await.unwrap();
+            a
         });
+
+        let b = TcpStream::connect(addr).await.unwrap();
+        let a = h.await.unwrap();
+        a.set_nodelay(true).unwrap();
+        b.set_nodelay(true).unwrap();
+        (a, b)
     }
 
-    #[test]
-    fn concurrent_connect_accept() {
-        init();
-        smol::block_on(async move {
-            let (a, b) = get_tcp_stream_pair().await;
-            const STREAM_COUNT: i32 = 100;
-            let t = smol::spawn(async move {
-                let mux_a = Mux::new(a, MuxConfig::default());
-                let (tx, mut rx) = bounded(0x100);
-                for i in 0..STREAM_COUNT {
-                    let mut stream = mux_a.connect().await.unwrap();
-                    log::debug!("connected: {}", i);
-                    let payload = [i as u8; 1];
-                    let tx = tx.clone();
-                    smol::spawn(async move {
-                        stream.write_all(&payload).await.unwrap();
-                        let mut buf = [0u8; 0x100];
-                        let size = stream.read(&mut buf).await.unwrap();
-                        assert_eq!(size, payload.len());
-                        assert_eq!(payload[0] + 1, buf[0]);
-                        tx.send(()).await.unwrap();
-                    })
-                    .detach();
-                }
-                for i in 0..STREAM_COUNT {
-                    log::debug!("a done: {}", i);
-                    rx.next().await.unwrap();
-                }
-            });
-            let (tx, rx) = bounded(0x100);
-            let mux_b = Mux::new(b, MuxConfig::default());
-            for i in 0..STREAM_COUNT {
-                let mut stream = mux_b.accept().await.unwrap();
-                log::debug!("accepted: {}", i);
-                let tx = tx.clone();
-                smol::spawn(async move {
-                    let mut buf = [0u8; 0x100];
-                    let size = stream.read(&mut buf).await.unwrap();
-                    for i in buf[..size].iter_mut() {
-                        *i = *i + 1;
-                    }
-                    stream.write_all(&buf[..size]).await.unwrap();
-                    log::debug!("{:?}", &buf[..size]);
-                    tx.send(()).await.unwrap();
-                })
-                .detach();
-            }
-            for i in 0..STREAM_COUNT {
-                log::debug!("b done: {}", i);
-                rx.recv().await.unwrap();
-            }
-            t.await
+    async fn test_stream<T: TokioConn>(mut a: MuxStream<T>, mut b: MuxStream<T>) {
+        const LEN: usize = MAX_PAYLOAD_SIZE + 0x200;
+        let mut data1 = vec![0; LEN];
+        let mut data2 = vec![0; LEN];
+        rand::thread_rng().fill_bytes(&mut data1);
+        rand::thread_rng().fill_bytes(&mut data2);
+
+        let mut buf = vec![0; LEN];
+
+        a.write_all(&data1).await.unwrap();
+        a.flush().await.unwrap();
+        b.write_all(&data2).await.unwrap();
+        b.flush().await.unwrap();
+
+        a.read_exact(&mut buf).await.unwrap();
+        assert_eq!(buf, data2);
+        b.read_exact(&mut buf).await.unwrap();
+        assert_eq!(buf, data1);
+
+        a.write_all(&data1).await.unwrap();
+        a.flush().await.unwrap();
+        b.read_exact(&mut buf[..LEN / 2]).await.unwrap();
+        b.read_exact(&mut buf[LEN / 2..]).await.unwrap();
+        assert_eq!(buf, data1);
+
+        a.write_all(&data1[..LEN / 2]).await.unwrap();
+        a.flush().await.unwrap();
+        b.read_exact(&mut buf[..LEN / 2]).await.unwrap();
+        assert_eq!(buf[..LEN / 2], data1[..LEN / 2]);
+
+        a.shutdown().await.unwrap();
+        b.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_tcp() {
+        let (a, b) = get_tcp_pair().await;
+        let (connector_a, mut acceptor_a, worker_a) = mux_connection(a);
+        let (connector_b, mut acceptor_b, worker_b) = mux_connection(b);
+        tokio::spawn(async move {
+            worker_a.await.unwrap();
         });
-    }
+        tokio::spawn(async move {
+            worker_b.await.unwrap();
+        });
 
-    #[test]
-    fn close() {
-        init();
-        smol::block_on(async move {
-            let (a, b) = get_tcp_stream_pair().await;
-            let mux_a = Mux::new(a, MuxConfig::default());
-            let mux_b = Mux::new(b, MuxConfig::default());
-            let mut stream_a = mux_a.connect().await.unwrap();
-            let mut stream_b = mux_b.accept().await.unwrap();
-            stream_a.write(b"hello").await.unwrap();
-            let mut buf = [0u8; 0x100];
-            let size = stream_b.read(&mut buf).await.unwrap();
-            assert_eq!(&buf[..size], b"hello");
-            stream_a.close().await.unwrap();
-            assert!(stream_a.write(b"hello").await.is_err());
-            assert!(stream_b.read(&mut buf).await.is_err());
-            assert!(stream_b.write(b"hello").await.is_err());
-        })
-    }
+        let stream1 = connector_a.connect().unwrap();
+        let stream2 = acceptor_b.accept().await.unwrap();
+        test_stream(stream1, stream2).await;
 
-    #[test]
-    fn clean() {
-        init();
-        smol::block_on(async move {
-            let (a, b) = get_tcp_stream_pair().await;
-            let mux_a = Mux::new(a, MuxConfig::default());
-            let mux_b = Mux::new(b, MuxConfig::default());
-            let stream1_a = mux_a.connect().await.unwrap();
-            let _stream2_a = mux_a.connect().await.unwrap();
-            let mut _stream1_b = mux_b.accept().await.unwrap();
-            let mut _stream2_b = mux_b.accept().await.unwrap();
-            drop(stream1_a);
-            mux_a.clean().await.unwrap();
-            assert_eq!(mux_a.mux_future_generator.stream_meta.lock().await.len(), 1);
-        })
-    }
+        let stream1 = connector_b.connect().unwrap();
+        let stream2 = acceptor_a.accept().await.unwrap();
+        test_stream(stream1, stream2).await;
 
-    #[test]
-    fn huge_payload() {
-        init();
-        smol::block_on(async move {
-            let (a, b) = get_tcp_stream_pair().await;
-            let mux_a = Mux::new(a, MuxConfig::default());
-            let mux_b = Mux::new(b, MuxConfig::default());
-            let mut stream_a = mux_a.connect().await.unwrap();
-            let mut stream_b = mux_b.accept().await.unwrap();
-            let mut payload = Vec::new();
-            payload.resize(0x100000, 0);
-            rand::thread_rng().fill_bytes(&mut payload);
-            let payload = Arc::new(payload);
-            {
-                let payload = payload.clone();
-                smol::spawn(async move {
-                    stream_a.write_all(&payload).await.unwrap();
-                    stream_a.close().await.unwrap();
+        assert_eq!(connector_a.state.lock().handles.len(), 0);
+        assert_eq!(connector_b.state.lock().handles.len(), 0);
+
+        let mut streams1 = vec![];
+        let mut streams2 = vec![];
+        const STREAM_NUM: usize = 0x1000;
+        for _ in 0..STREAM_NUM {
+            let stream = connector_a.connect().unwrap();
+            streams1.push(stream);
+        }
+        for _ in 0..STREAM_NUM {
+            let stream = acceptor_b.accept().await.unwrap();
+            streams2.push(stream);
+        }
+
+        let handles = streams1
+            .into_iter()
+            .zip(streams2.into_iter())
+            .map(|(a, b)| {
+                tokio::spawn(async move {
+                    test_stream(a, b).await;
                 })
-                .detach();
-            }
-            let mut buf = Vec::new();
-            buf.resize(0x100000, 0);
-            stream_b.read_exact(&mut buf).await.unwrap();
-            assert_eq!(&buf[..], &payload[..]);
-        })
+            })
+            .collect::<Vec<_>>();
+
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        assert_eq!(connector_a.state.lock().handles.len(), 0);
+        assert_eq!(connector_b.state.lock().handles.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_shutdown() {
+        let (a, b) = get_tcp_pair().await;
+        let (connector_a, acceptor_a, worker_a) = mux_connection(a);
+        let (connector_b, mut acceptor_b, worker_b) = mux_connection(b);
+        tokio::spawn(async move {
+            worker_a.await.unwrap();
+        });
+        tokio::spawn(async move {
+            worker_b.await.unwrap();
+        });
+
+        let mut stream1 = connector_a.connect().unwrap();
+        let mut stream2 = acceptor_b.accept().await.unwrap();
+
+        let data = [1, 2, 3, 4];
+        stream2.write_all(&data).await.unwrap();
+        stream2.shutdown().await.unwrap();
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        stream1.write_all(&[0, 1, 2, 3]).await.unwrap_err();
+        stream1.flush().await.unwrap_err();
+        let mut buf = vec![0; 4];
+        stream1.read_exact(&mut buf).await.unwrap();
+        assert!(buf == data);
+        stream1.read(&mut buf).await.unwrap_err();
+
+        drop(acceptor_a);
+        let mut stream = connector_b.connect().unwrap();
+        stream.read(&mut buf).await.unwrap_err();
+        stream.flush().await.unwrap_err();
+        stream.shutdown().await.unwrap();
     }
 }
