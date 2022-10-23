@@ -65,9 +65,10 @@ pub struct MuxConnector<T: TokioConn> {
 
 impl<T: TokioConn> MuxConnector<T> {
     pub fn connect(&self) -> MuxResult<MuxStream<T>> {
-        let stream_id = rand::random();
-
         let mut state = self.state.lock();
+        state.check_tx_closed()?;
+
+        let stream_id = rand::random();
         state.process_sync(stream_id)?;
         let frame = MuxFrame::new(MuxCommand::Sync, stream_id, Bytes::new());
         state.enqueue_frame_global(frame);
@@ -97,6 +98,9 @@ impl<T: TokioConn> Stream for MuxAcceptor<T> {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let mut state = self.state.lock();
+        if state.check_rx_closed().is_err() {
+            return Poll::Ready(None);
+        }
 
         if let Some(stream) = state.accept_queue.pop_front() {
             Poll::Ready(Some(stream))
@@ -116,6 +120,7 @@ impl<T: TokioConn> MuxAcceptor<T> {
 struct MuxSender<T: TokioConn> {
     state: Arc<Mutex<MuxState<T>>>,
 }
+
 impl<T: TokioConn> Future for MuxSender<T> {
     type Output = MuxResult<()>;
 
@@ -129,8 +134,20 @@ impl<T: TokioConn> Future for MuxSender<T> {
     }
 }
 
-pub struct MuxDispatcher<T: TokioConn> {
+impl<T: TokioConn> Drop for MuxSender<T> {
+    fn drop(&mut self) {
+        self.state.lock().close_tx();
+    }
+}
+
+struct MuxDispatcher<T: TokioConn> {
     state: Arc<Mutex<MuxState<T>>>,
+}
+
+impl<T: TokioConn> Drop for MuxDispatcher<T> {
+    fn drop(&mut self) {
+        self.state.lock().close_rx();
+    }
 }
 
 impl<T: TokioConn> Future for MuxDispatcher<T> {
@@ -163,9 +180,7 @@ impl<T: TokioConn> Future for MuxDispatcher<T> {
                         read_buffer: None,
                     };
                     state.accept_queue.push_back(stream);
-                    if let Some(waker) = state.accept_waker.take() {
-                        waker.wake();
-                    }
+                    state.wake_accept();
                 }
                 MuxCommand::Finish => {
                     state.process_finish(frame.header.stream_id);
@@ -239,16 +254,10 @@ impl<T: TokioConn> AsyncRead for MuxStream<T> {
                 return Poll::Ready(Ok(()));
             }
 
-            let r = ready!(self.state.lock().poll_read_data(cx, self.stream_id));
-            if let Some(frame) = r {
-                debug_assert_eq!(frame.header.command, MuxCommand::Push);
-                self.read_buffer = Some(frame.payload);
-            } else {
-                return Poll::Ready(Err(StdIo::Error::new(
-                    ErrorKind::ConnectionReset,
-                    format!("No such stream id: {:x}", self.stream_id),
-                )));
-            }
+            let frame = ready!(self.state.lock().poll_read_stream_data(cx, self.stream_id))
+                .map_err(mux_to_io_err)?;
+            debug_assert_eq!(frame.header.command, MuxCommand::Push);
+            self.read_buffer = Some(frame.payload);
         }
     }
 }
@@ -297,6 +306,7 @@ impl<T: TokioConn> AsyncWrite for MuxStream<T> {
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), StdIo::Error>> {
         loop {
             let mut state = self.state.lock();
+            state.check_tx_closed().map_err(mux_to_io_err)?;
             ready!(state
                 .poll_flush_stream_frames(cx, self.stream_id)
                 .map_err(mux_to_io_err))?;
@@ -444,18 +454,19 @@ impl<T: TokioConn> MuxState<T> {
         Ok(())
     }
 
-    fn poll_read_data(&mut self, cx: &mut Context<'_>, stream_id: u32) -> Poll<Option<MuxFrame>> {
-        if let Some(handle) = self.handles.get_mut(&stream_id) {
-            if let Some(f) = handle.rx_queue.pop_front() {
-                Poll::Ready(Some(f))
-            } else if handle.closed {
-                Poll::Ready(None)
-            } else {
-                handle.rx_waker = Some(cx.waker().clone());
-                Poll::Pending
-            }
+    fn poll_read_stream_data(
+        &mut self,
+        cx: &mut Context<'_>,
+        stream_id: u32,
+    ) -> Poll<MuxResult<MuxFrame>> {
+        let handle = self.handles.get_mut(&stream_id).unwrap();
+        if let Some(f) = handle.rx_queue.pop_front() {
+            Poll::Ready(Ok(f))
+        } else if handle.closed {
+            Poll::Ready(Err(MuxError::StreamClosed(stream_id)))
         } else {
-            Poll::Ready(None)
+            handle.rx_waker = Some(cx.waker().clone());
+            Poll::Pending
         }
     }
 
@@ -489,6 +500,45 @@ impl<T: TokioConn> MuxState<T> {
             handle.tx_waker = Some(cx.waker().clone());
             self.notify_tx();
             Poll::Pending
+        }
+    }
+
+    fn wake_accept(&mut self) {
+        if let Some(waker) = self.accept_waker.take() {
+            waker.wake();
+        }
+    }
+
+    fn close_tx(&mut self) {
+        self.tx_closed = true;
+        for (_, handle) in self.handles.iter_mut() {
+            handle.closed = true;
+            handle.wake_tx();
+        }
+    }
+
+    fn close_rx(&mut self) {
+        self.rx_closed = true;
+        self.wake_accept();
+        for (_, handle) in self.handles.iter_mut() {
+            handle.closed = true;
+            handle.wake_rx();
+        }
+    }
+
+    fn check_rx_closed(&self) -> MuxResult<()> {
+        if self.tx_closed {
+            Err(MuxError::ConnectionClosed)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn check_tx_closed(&self) -> MuxResult<()> {
+        if self.tx_closed {
+            Err(MuxError::ConnectionClosed)
+        } else {
+            Ok(())
         }
     }
 
@@ -648,6 +698,27 @@ mod tests {
         assert_eq!(connector_b.state.lock().handles.len(), 0);
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_worker_drop() {
+        let (a, b) = get_tcp_pair().await;
+        let (connector_a, mut acceptor_a, worker_a) = mux_connection(a);
+        let (connector_b, mut acceptor_b, worker_b) = mux_connection(b);
+        let mut stream1 = connector_a.connect().unwrap();
+        let h1 = tokio::spawn(async move {
+            let mut buf = vec![0; 0x100];
+            stream1.read_exact(&mut buf).await.unwrap_err();
+        });
+
+        drop(worker_a);
+        drop(worker_b);
+
+        assert!(connector_a.connect().is_err());
+        assert!(connector_b.connect().is_err());
+        assert!(acceptor_a.accept().await.is_none());
+        assert!(acceptor_b.accept().await.is_none());
+        h1.await.unwrap();
+    }
+
     #[tokio::test]
     async fn test_shutdown() {
         let (a, b) = get_tcp_pair().await;
@@ -681,5 +752,18 @@ mod tests {
         stream.read(&mut buf).await.unwrap_err();
         stream.flush().await.unwrap_err();
         stream.shutdown().await.unwrap();
+
+        let mut stream1 = connector_a.connect().unwrap();
+        let mut stream2 = acceptor_b.accept().await.unwrap();
+        stream1.write_all(&data).await.unwrap();
+        stream1.flush().await.unwrap();
+        drop(stream1);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let mut buf = vec![0; 4];
+        stream2.read_exact(&mut buf).await.unwrap();
+        assert!(buf == data);
+        stream2.read_exact(&mut buf).await.unwrap_err();
+        stream2.write_all(&data).await.unwrap_err();
     }
 }
