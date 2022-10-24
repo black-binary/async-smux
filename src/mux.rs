@@ -59,6 +59,7 @@ pub fn mux_connection<T: TokioConn>(
     )
 }
 
+#[derive(Clone)]
 pub struct MuxConnector<T: TokioConn> {
     state: Arc<Mutex<MuxState<T>>>,
 }
@@ -80,6 +81,10 @@ impl<T: TokioConn> MuxConnector<T> {
             read_buffer: None,
         };
         Ok(stream)
+    }
+
+    pub fn num_streams(&self) -> usize {
+        self.state.lock().handles.len()
     }
 }
 
@@ -114,6 +119,10 @@ impl<T: TokioConn> Stream for MuxAcceptor<T> {
 impl<T: TokioConn> MuxAcceptor<T> {
     pub async fn accept(&mut self) -> Option<MuxStream<T>> {
         self.next().await
+    }
+
+    pub fn num_streams(&mut self) -> usize {
+        self.state.lock().handles.len()
     }
 }
 
@@ -665,8 +674,10 @@ mod tests {
         let stream2 = acceptor_a.accept().await.unwrap();
         test_stream(stream1, stream2).await;
 
-        assert_eq!(connector_a.state.lock().handles.len(), 0);
-        assert_eq!(connector_b.state.lock().handles.len(), 0);
+        assert_eq!(connector_a.num_streams(), 0);
+        assert_eq!(connector_b.num_streams(), 0);
+        assert_eq!(acceptor_a.num_streams(), 0);
+        assert_eq!(acceptor_b.num_streams(), 0);
 
         let mut streams1 = vec![];
         let mut streams2 = vec![];
@@ -694,8 +705,10 @@ mod tests {
             h.await.unwrap();
         }
 
-        assert_eq!(connector_a.state.lock().handles.len(), 0);
-        assert_eq!(connector_b.state.lock().handles.len(), 0);
+        assert_eq!(connector_a.num_streams(), 0);
+        assert_eq!(connector_b.num_streams(), 0);
+        assert_eq!(acceptor_a.num_streams(), 0);
+        assert_eq!(acceptor_b.num_streams(), 0);
     }
 
     #[tokio::test(flavor = "multi_thread")]

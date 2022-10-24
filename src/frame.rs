@@ -31,14 +31,14 @@ impl MuxCommand {
 }
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
-pub(crate) struct FrameHeader {
+pub(crate) struct MuxFrameHeader {
     pub version: u8,
     pub command: MuxCommand,
     pub length: u16,
     pub stream_id: u32,
 }
 
-impl FrameHeader {
+impl MuxFrameHeader {
     #[inline]
     pub fn encode(&self, buf: &mut [u8]) {
         let mut cur = buf;
@@ -69,7 +69,7 @@ impl FrameHeader {
 
 #[derive(Clone)]
 pub(crate) struct MuxFrame {
-    pub header: FrameHeader,
+    pub header: MuxFrameHeader,
     pub payload: Bytes,
 }
 
@@ -77,7 +77,7 @@ impl MuxFrame {
     pub fn new(command: MuxCommand, stream_id: u32, payload: Bytes) -> Self {
         assert!(payload.len() <= MAX_PAYLOAD_SIZE);
         Self {
-            header: FrameHeader {
+            header: MuxFrameHeader {
                 version: SMUX_VERSION,
                 command,
                 length: payload.len() as u16,
@@ -98,7 +98,7 @@ impl Decoder for MuxCodec {
         if src.len() < HEADER_SIZE {
             return Ok(None);
         }
-        let header = FrameHeader::decode(src)?;
+        let header = MuxFrameHeader::decode(src)?;
         let len = header.length as usize;
         if src.len() < HEADER_SIZE + len {
             return Ok(None);
