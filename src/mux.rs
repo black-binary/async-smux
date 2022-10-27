@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     io::ErrorKind,
+    num::Wrapping,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll, Waker},
@@ -18,6 +19,7 @@ use tokio::io::{self, AsyncRead, AsyncWrite};
 use tokio_util::codec::Framed;
 
 use crate::{
+    config::{MuxConfig, StreamIdType},
     error::{MuxError, MuxResult},
     frame::{MuxCodec, MuxCommand, MuxFrame, MAX_PAYLOAD_SIZE},
 };
@@ -28,6 +30,7 @@ impl<T> TokioConn for T where T: AsyncRead + AsyncWrite + Unpin {}
 
 pub fn mux_connection<T: TokioConn>(
     connection: T,
+    config: MuxConfig,
 ) -> (MuxConnector<T>, MuxAcceptor<T>, MuxWorker<T>) {
     let inner = Framed::new(connection, MuxCodec {});
     let state = Arc::new(Mutex::new(MuxState {
@@ -40,6 +43,8 @@ pub fn mux_connection<T: TokioConn>(
         tx_waker: None,
         tx_closed: false,
         rx_closed: false,
+        stream_id_hint: Wrapping(config.stream_id_type as u32),
+        stream_id_type: config.stream_id_type,
     }));
     (
         MuxConnector {
@@ -69,11 +74,11 @@ impl<T: TokioConn> MuxConnector<T> {
         let mut state = self.state.lock();
         state.check_tx_closed()?;
 
-        let stream_id = rand::random();
-        state.process_sync(stream_id)?;
+        let stream_id = state.alloc_stream_id()?;
+        state.process_sync(stream_id, false)?;
         let frame = MuxFrame::new(MuxCommand::Sync, stream_id, Bytes::new());
         state.enqueue_frame_global(frame);
-        state.notify_tx();
+        state.wake_tx();
 
         let stream = MuxStream {
             stream_id,
@@ -110,7 +115,7 @@ impl<T: TokioConn> Stream for MuxAcceptor<T> {
         if let Some(stream) = state.accept_queue.pop_front() {
             Poll::Ready(Some(stream))
         } else {
-            state.accept_waker = Some(cx.waker().clone());
+            state.register_accept_waker(cx);
             Poll::Pending
         }
     }
@@ -136,9 +141,9 @@ impl<T: TokioConn> Future for MuxSender<T> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         loop {
             let mut state = self.state.lock();
-            ready!(state.poll_ready_tx(cx))?;
             ready!(state.poll_flush_frames(cx))?;
             ready!(state.poll_flush_inner(cx))?;
+            ready!(state.poll_ready_tx(cx))?;
         }
     }
 }
@@ -177,11 +182,7 @@ impl<T: TokioConn> Future for MuxDispatcher<T> {
                         continue;
                     }
 
-                    if state.process_sync(frame.header.stream_id).is_err() {
-                        // Duplicated
-                        state.send_finish(frame.header.stream_id);
-                        continue;
-                    }
+                    state.process_sync(frame.header.stream_id, true)?;
 
                     let stream = MuxStream {
                         stream_id: frame.header.stream_id,
@@ -224,7 +225,6 @@ impl<T: TokioConn> Future for MuxWorker<T> {
 pub struct MuxStream<T: TokioConn> {
     stream_id: u32,
     state: Arc<Mutex<MuxState<T>>>,
-
     read_buffer: Option<Bytes>,
 }
 
@@ -238,7 +238,7 @@ impl<T: TokioConn> Drop for MuxStream<T> {
                 self.stream_id,
                 Bytes::new(),
             ));
-            state.notify_tx();
+            state.wake_tx();
         }
         state.remove_stream(self.stream_id);
     }
@@ -272,7 +272,7 @@ impl<T: TokioConn> AsyncRead for MuxStream<T> {
 }
 
 fn mux_to_io_err(e: MuxError) -> StdIo::Error {
-    StdIo::Error::new(ErrorKind::ConnectionReset, e)
+    StdIo::Error::new(ErrorKind::Other, e)
 }
 
 impl<T: TokioConn> AsyncWrite for MuxStream<T> {
@@ -281,8 +281,7 @@ impl<T: TokioConn> AsyncWrite for MuxStream<T> {
         _: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<Result<usize, StdIo::Error>> {
-        let state = self.state.clone();
-        let mut state = state.lock();
+        let mut state = self.state.lock();
         if !state.is_open(self.stream_id) {
             return Poll::Ready(Err(StdIo::ErrorKind::ConnectionReset.into()));
         }
@@ -294,7 +293,7 @@ impl<T: TokioConn> AsyncWrite for MuxStream<T> {
             let frame = MuxFrame::new(MuxCommand::Push, self.stream_id, payload);
             state.enqueue_frame_stream(self.stream_id, frame);
         }
-        state.notify_tx();
+        state.wake_tx();
         Poll::Ready(Ok(buf.len()))
     }
 
@@ -326,7 +325,7 @@ impl<T: TokioConn> AsyncWrite for MuxStream<T> {
             state.process_finish(self.stream_id);
             let frame = MuxFrame::new(MuxCommand::Finish, self.stream_id, Bytes::new());
             state.enqueue_frame_stream(self.stream_id, frame);
-            state.notify_tx();
+            state.wake_tx();
         }
     }
 }
@@ -342,6 +341,16 @@ struct StreamHandle {
 }
 
 impl StreamHandle {
+    #[inline]
+    fn register_tx_waker(&mut self, cx: &Context<'_>) {
+        self.tx_waker = Some(cx.waker().clone());
+    }
+
+    #[inline]
+    fn register_rx_waker(&mut self, cx: &Context<'_>) {
+        self.rx_waker = Some(cx.waker().clone());
+    }
+
     #[inline]
     fn wake_rx(&mut self) {
         if let Some(waker) = self.rx_waker.take() {
@@ -370,9 +379,24 @@ struct MuxState<T: TokioConn> {
 
     tx_closed: bool,
     rx_closed: bool,
+
+    stream_id_hint: Wrapping<u32>,
+    stream_id_type: StreamIdType,
 }
 
 impl<T: TokioConn> MuxState<T> {
+    fn alloc_stream_id(&mut self) -> MuxResult<u32> {
+        if self.handles.len() >= (u32::MAX / 2) as usize {
+            return Err(MuxError::TooManyStreams);
+        }
+
+        while self.handles.contains_key(&self.stream_id_hint.0) {
+            self.stream_id_hint.0 += 2;
+        }
+
+        Ok(self.stream_id_hint.0)
+    }
+
     fn remove_stream(&mut self, stream_id: u32) {
         self.handles
             .remove(&stream_id)
@@ -381,12 +405,19 @@ impl<T: TokioConn> MuxState<T> {
 
     fn send_finish(&mut self, stream_id: u32) {
         self.enqueue_frame_global(MuxFrame::new(MuxCommand::Finish, stream_id, Bytes::new()));
-        self.notify_tx();
+        self.wake_tx();
     }
 
-    fn process_sync(&mut self, stream_id: u32) -> MuxResult<()> {
+    fn process_sync(&mut self, stream_id: u32, from_peer: bool) -> MuxResult<()> {
         if self.handles.contains_key(&stream_id) {
             return Err(MuxError::DuplicatedStreamId(stream_id));
+        }
+
+        if (stream_id % 2 != self.stream_id_type as _) ^ from_peer {
+            return Err(MuxError::InvalidPeerStreamIdType(
+                stream_id,
+                self.stream_id_type,
+            ));
         }
 
         let handle = StreamHandle {
@@ -474,7 +505,7 @@ impl<T: TokioConn> MuxState<T> {
         } else if handle.closed {
             Poll::Ready(Err(MuxError::StreamClosed(stream_id)))
         } else {
-            handle.rx_waker = Some(cx.waker().clone());
+            handle.register_rx_waker(cx);
             Poll::Pending
         }
     }
@@ -487,11 +518,18 @@ impl<T: TokioConn> MuxState<T> {
             .push_back(frame)
     }
 
+    #[inline]
     fn enqueue_frame_global(&mut self, frame: MuxFrame) {
         self.tx_queue.push_back(frame);
     }
 
-    fn notify_tx(&mut self) {
+    #[inline]
+    fn register_tx_waker(&mut self, cx: &Context<'_>) {
+        self.tx_waker = Some(cx.waker().clone());
+    }
+
+    #[inline]
+    fn wake_tx(&mut self) {
         if let Some(waker) = self.tx_waker.take() {
             waker.wake();
         }
@@ -506,12 +544,18 @@ impl<T: TokioConn> MuxState<T> {
         if handle.tx_queue.is_empty() {
             Poll::Ready(Ok(()))
         } else {
-            handle.tx_waker = Some(cx.waker().clone());
-            self.notify_tx();
+            handle.register_tx_waker(cx);
+            self.wake_tx();
             Poll::Pending
         }
     }
 
+    #[inline]
+    fn register_accept_waker(&mut self, cx: &Context<'_>) {
+        self.accept_waker = Some(cx.waker().clone());
+    }
+
+    #[inline]
     fn wake_accept(&mut self) {
         if let Some(waker) = self.accept_waker.take() {
             waker.wake();
@@ -585,198 +629,10 @@ impl<T: TokioConn> MuxState<T> {
         }
 
         if self.tx_queue.is_empty() && self.handles.iter().all(|(_, h)| h.tx_queue.is_empty()) {
-            self.tx_waker = Some(cx.waker().clone());
+            self.register_tx_waker(cx);
             Poll::Pending
         } else {
             Poll::Ready(Ok(()))
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::time::Duration;
-
-    use rand::RngCore;
-    use tokio::{
-        io::{AsyncReadExt, AsyncWriteExt},
-        net::{TcpListener, TcpStream},
-    };
-
-    use crate::{frame::MAX_PAYLOAD_SIZE, mux::TokioConn, mux_connection, MuxStream};
-
-    async fn get_tcp_pair() -> (TcpStream, TcpStream) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let h = tokio::spawn(async move {
-            let (a, _) = listener.accept().await.unwrap();
-            a
-        });
-
-        let b = TcpStream::connect(addr).await.unwrap();
-        let a = h.await.unwrap();
-        a.set_nodelay(true).unwrap();
-        b.set_nodelay(true).unwrap();
-        (a, b)
-    }
-
-    async fn test_stream<T: TokioConn>(mut a: MuxStream<T>, mut b: MuxStream<T>) {
-        const LEN: usize = MAX_PAYLOAD_SIZE + 0x200;
-        let mut data1 = vec![0; LEN];
-        let mut data2 = vec![0; LEN];
-        rand::thread_rng().fill_bytes(&mut data1);
-        rand::thread_rng().fill_bytes(&mut data2);
-
-        let mut buf = vec![0; LEN];
-
-        a.write_all(&data1).await.unwrap();
-        a.flush().await.unwrap();
-        b.write_all(&data2).await.unwrap();
-        b.flush().await.unwrap();
-
-        a.read_exact(&mut buf).await.unwrap();
-        assert_eq!(buf, data2);
-        b.read_exact(&mut buf).await.unwrap();
-        assert_eq!(buf, data1);
-
-        a.write_all(&data1).await.unwrap();
-        a.flush().await.unwrap();
-        b.read_exact(&mut buf[..LEN / 2]).await.unwrap();
-        b.read_exact(&mut buf[LEN / 2..]).await.unwrap();
-        assert_eq!(buf, data1);
-
-        a.write_all(&data1[..LEN / 2]).await.unwrap();
-        a.flush().await.unwrap();
-        b.read_exact(&mut buf[..LEN / 2]).await.unwrap();
-        assert_eq!(buf[..LEN / 2], data1[..LEN / 2]);
-
-        a.shutdown().await.unwrap();
-        b.shutdown().await.unwrap();
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_tcp() {
-        let (a, b) = get_tcp_pair().await;
-        let (connector_a, mut acceptor_a, worker_a) = mux_connection(a);
-        let (connector_b, mut acceptor_b, worker_b) = mux_connection(b);
-        tokio::spawn(async move {
-            worker_a.await.unwrap();
-        });
-        tokio::spawn(async move {
-            worker_b.await.unwrap();
-        });
-
-        let stream1 = connector_a.connect().unwrap();
-        let stream2 = acceptor_b.accept().await.unwrap();
-        test_stream(stream1, stream2).await;
-
-        let stream1 = connector_b.connect().unwrap();
-        let stream2 = acceptor_a.accept().await.unwrap();
-        test_stream(stream1, stream2).await;
-
-        assert_eq!(connector_a.get_num_streams(), 0);
-        assert_eq!(connector_b.get_num_streams(), 0);
-        assert_eq!(acceptor_a.get_num_streams(), 0);
-        assert_eq!(acceptor_b.get_num_streams(), 0);
-
-        let mut streams1 = vec![];
-        let mut streams2 = vec![];
-        const STREAM_NUM: usize = 0x1000;
-        for _ in 0..STREAM_NUM {
-            let stream = connector_a.connect().unwrap();
-            streams1.push(stream);
-        }
-        for _ in 0..STREAM_NUM {
-            let stream = acceptor_b.accept().await.unwrap();
-            streams2.push(stream);
-        }
-
-        let handles = streams1
-            .into_iter()
-            .zip(streams2.into_iter())
-            .map(|(a, b)| {
-                tokio::spawn(async move {
-                    test_stream(a, b).await;
-                })
-            })
-            .collect::<Vec<_>>();
-
-        for h in handles {
-            h.await.unwrap();
-        }
-
-        assert_eq!(connector_a.get_num_streams(), 0);
-        assert_eq!(connector_b.get_num_streams(), 0);
-        assert_eq!(acceptor_a.get_num_streams(), 0);
-        assert_eq!(acceptor_b.get_num_streams(), 0);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_worker_drop() {
-        let (a, b) = get_tcp_pair().await;
-        let (connector_a, mut acceptor_a, worker_a) = mux_connection(a);
-        let (connector_b, mut acceptor_b, worker_b) = mux_connection(b);
-        let mut stream1 = connector_a.connect().unwrap();
-        let h1 = tokio::spawn(async move {
-            let mut buf = vec![0; 0x100];
-            stream1.read_exact(&mut buf).await.unwrap_err();
-        });
-
-        drop(worker_a);
-        drop(worker_b);
-
-        assert!(connector_a.connect().is_err());
-        assert!(connector_b.connect().is_err());
-        assert!(acceptor_a.accept().await.is_none());
-        assert!(acceptor_b.accept().await.is_none());
-        h1.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_shutdown() {
-        let (a, b) = get_tcp_pair().await;
-        let (connector_a, acceptor_a, worker_a) = mux_connection(a);
-        let (connector_b, mut acceptor_b, worker_b) = mux_connection(b);
-        tokio::spawn(async move {
-            worker_a.await.unwrap();
-        });
-        tokio::spawn(async move {
-            worker_b.await.unwrap();
-        });
-
-        let mut stream1 = connector_a.connect().unwrap();
-        let mut stream2 = acceptor_b.accept().await.unwrap();
-
-        let data = [1, 2, 3, 4];
-        stream2.write_all(&data).await.unwrap();
-        stream2.shutdown().await.unwrap();
-
-        tokio::time::sleep(Duration::from_secs(1)).await;
-
-        stream1.write_all(&[0, 1, 2, 3]).await.unwrap_err();
-        stream1.flush().await.unwrap_err();
-        let mut buf = vec![0; 4];
-        stream1.read_exact(&mut buf).await.unwrap();
-        assert!(buf == data);
-        stream1.read(&mut buf).await.unwrap_err();
-
-        drop(acceptor_a);
-        let mut stream = connector_b.connect().unwrap();
-        stream.read(&mut buf).await.unwrap_err();
-        stream.flush().await.unwrap_err();
-        stream.shutdown().await.unwrap();
-
-        let mut stream1 = connector_a.connect().unwrap();
-        let mut stream2 = acceptor_b.accept().await.unwrap();
-        stream1.write_all(&data).await.unwrap();
-        stream1.flush().await.unwrap();
-        drop(stream1);
-        tokio::time::sleep(Duration::from_secs(1)).await;
-
-        let mut buf = vec![0; 4];
-        stream2.read_exact(&mut buf).await.unwrap();
-        assert!(buf == data);
-        stream2.read_exact(&mut buf).await.unwrap_err();
-        stream2.write_all(&data).await.unwrap_err();
     }
 }
