@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::num::NonZeroU64;
 
 use crate::{
     config::{MuxConfig, StreamIdType},
@@ -28,6 +28,7 @@ impl MuxBuilder<Begin> {
                 config: MuxConfig {
                     stream_id_type: StreamIdType::Odd,
                     keep_alive_interval: None,
+                    idle_timeout: None,
                 },
             },
         }
@@ -39,6 +40,7 @@ impl MuxBuilder<Begin> {
                 config: MuxConfig {
                     stream_id_type: StreamIdType::Even,
                     keep_alive_interval: None,
+                    idle_timeout: None,
                 },
             },
         }
@@ -46,8 +48,13 @@ impl MuxBuilder<Begin> {
 }
 
 impl MuxBuilder<WithConfig> {
-    pub fn with_keep_alive_interval(&mut self, interval: Duration) -> &mut Self {
-        self.state.config.keep_alive_interval = Some(interval);
+    pub fn with_keep_alive_interval(&mut self, interval_secs: NonZeroU64) -> &mut Self {
+        self.state.config.keep_alive_interval = Some(interval_secs);
+        self
+    }
+
+    pub fn with_idle_timeout(&mut self, timeout_secs: NonZeroU64) -> &mut Self {
+        self.state.config.idle_timeout = Some(timeout_secs);
         self
     }
 

@@ -17,15 +17,16 @@ pub(crate) enum MuxCommand {
     Nop = 3,
 }
 
-impl MuxCommand {
-    #[inline]
-    fn try_from_u8(val: u8) -> MuxResult<Self> {
-        match val {
+impl TryFrom<u8> for MuxCommand {
+    type Error = MuxError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
             0 => Ok(MuxCommand::Sync),
             1 => Ok(MuxCommand::Finish),
             2 => Ok(MuxCommand::Push),
             3 => Ok(MuxCommand::Nop),
-            _ => Err(MuxError::InvalidCommand(val)),
+            _ => Err(MuxError::InvalidCommand(value)),
         }
     }
 }
@@ -40,22 +41,21 @@ pub(crate) struct MuxFrameHeader {
 
 impl MuxFrameHeader {
     #[inline]
-    pub fn encode(&self, buf: &mut [u8]) {
-        let mut cur = buf;
-        cur.put_u8(self.version);
-        cur.put_u8(self.command as u8);
-        cur.put_u16(self.length);
-        cur.put_u32(self.stream_id);
+    fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u8(self.version);
+        buf.put_u8(self.command as u8);
+        buf.put_u16(self.length);
+        buf.put_u32(self.stream_id);
     }
 
     #[inline]
-    pub fn decode(buf: &[u8]) -> MuxResult<Self> {
+    fn decode(buf: &[u8]) -> MuxResult<Self> {
         let mut cursor = Cursor::new(buf);
         let version = cursor.get_u8();
         if version != SMUX_VERSION {
             return Err(MuxError::InvalidVersion(version));
         }
-        let command = MuxCommand::try_from_u8(cursor.get_u8())?;
+        let command = MuxCommand::try_from(cursor.get_u8())?;
         let length = cursor.get_u16();
         let stream_id = cursor.get_u32();
         Ok(Self {
@@ -125,10 +125,7 @@ impl Encoder<MuxFrame> for MuxCodec {
             return Err(MuxError::PayloadTooLarge(item.payload.len()));
         }
 
-        let mut header_buf = [0; 8];
-        item.header.encode(&mut header_buf);
-
-        dst.put_slice(&header_buf);
+        item.header.encode(dst);
         dst.put_slice(&item.payload);
 
         Ok(())

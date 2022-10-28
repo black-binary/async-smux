@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::num::NonZeroU64;
 
 #[derive(Clone, Copy, Debug)]
 pub enum StreamIdType {
@@ -9,5 +9,6 @@ pub enum StreamIdType {
 #[derive(Clone, Copy, Debug)]
 pub struct MuxConfig {
     pub stream_id_type: StreamIdType,
-    pub keep_alive_interval: Option<Duration>,
+    pub keep_alive_interval: Option<NonZeroU64>,
+    pub idle_timeout: Option<NonZeroU64>,
 }

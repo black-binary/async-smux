@@ -3,19 +3,24 @@ use std::{
     io::ErrorKind,
     num::Wrapping,
     pin::Pin,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     task::{Context, Poll, Waker},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use bytes::{Buf, Bytes};
-use futures::{
-    future::{select, Select},
-    ready, Future, FutureExt, SinkExt, Stream, StreamExt,
-};
+use futures::{ready, Future, FutureExt, SinkExt, Stream, StreamExt};
 use futures_sink::Sink;
 use parking_lot::Mutex;
 use std::io as StdIo;
-use tokio::io::{self, AsyncRead, AsyncWrite};
+use tokio::{
+    io::{self, AsyncRead, AsyncWrite},
+    macros::support::poll_fn,
+    time::{interval, Interval},
+};
 use tokio_util::codec::Framed;
 
 use crate::{
@@ -32,6 +37,7 @@ pub fn mux_connection<T: TokioConn>(
     connection: T,
     config: MuxConfig,
 ) -> (MuxConnector<T>, MuxAcceptor<T>, MuxWorker<T>) {
+    let timestamp = Arc::new(AtomicU64::new(get_timestamp_slow()));
     let inner = Framed::new(connection, MuxCodec {});
     let state = Arc::new(Mutex::new(MuxState {
         inner,
@@ -45,6 +51,7 @@ pub fn mux_connection<T: TokioConn>(
         rx_closed: false,
         stream_id_hint: Wrapping(config.stream_id_type as u32),
         stream_id_type: config.stream_id_type,
+        timestamp: timestamp.clone(),
     }));
     (
         MuxConnector {
@@ -54,12 +61,20 @@ pub fn mux_connection<T: TokioConn>(
             state: state.clone(),
         },
         MuxWorker {
-            select_fut: select(
-                MuxDispatcher {
-                    state: state.clone(),
-                },
-                MuxSender { state },
-            ),
+            dispatcher: MuxDispatcher {
+                state: state.clone(),
+            },
+            sender: MuxSender {
+                state: state.clone(),
+            },
+            timer: MuxTimer {
+                state,
+                interval: interval(Duration::from_millis(500)),
+                timestamp,
+                last_ping: get_timestamp_slow(),
+                keep_alive_interval: config.keep_alive_interval.map(|a| a.get()),
+                idle_timeout: config.idle_timeout.map(|a| a.get()),
+            },
         },
     )
 }
@@ -128,6 +143,79 @@ impl<T: TokioConn> MuxAcceptor<T> {
 
     pub fn get_num_streams(&mut self) -> usize {
         self.state.lock().handles.len()
+    }
+
+    pub async fn close(&mut self) -> MuxResult<()> {
+        poll_fn(|cx| {
+            let mut state = self.state.lock();
+            state.close_tx();
+            state.close_rx();
+            state.inner.poll_close_unpin(cx)
+        })
+        .await?;
+        Ok(())
+    }
+}
+
+#[inline]
+fn get_timestamp_slow() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+struct MuxTimer<T: TokioConn> {
+    state: Arc<Mutex<MuxState<T>>>,
+    interval: Interval,
+    timestamp: Arc<AtomicU64>,
+
+    last_ping: u64,
+    keep_alive_interval: Option<u64>,
+
+    idle_timeout: Option<u64>,
+}
+
+impl<T: TokioConn> Future for MuxTimer<T> {
+    type Output = MuxResult<()>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        loop {
+            ready!(self.interval.poll_tick(cx));
+            self.interval.reset();
+
+            let ts = get_timestamp_slow();
+            self.timestamp.store(ts, Ordering::SeqCst);
+            let mut state = self.state.lock();
+
+            // Ping
+            if let Some(keep_alive_interval) = self.keep_alive_interval {
+                if ts > self.last_ping + keep_alive_interval {
+                    state.enqueue_frame_global(MuxFrame::new(MuxCommand::Nop, 0, Bytes::new()));
+                    state.wake_tx();
+                }
+            }
+
+            // Clean timeout
+            if let Some(idle_timeout) = self.idle_timeout {
+                let dead_ids = state
+                    .handles
+                    .iter()
+                    .filter_map(|(id, h)| {
+                        if ts > h.last_active + idle_timeout {
+                            Some(*id)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>();
+
+                for stream_id in dead_ids {
+                    state.process_finish(stream_id);
+                    state.send_finish(stream_id);
+                }
+            }
+        }
     }
 }
 
@@ -210,15 +298,26 @@ impl<T: TokioConn> Future for MuxDispatcher<T> {
 }
 
 pub struct MuxWorker<T: TokioConn> {
-    select_fut: Select<MuxDispatcher<T>, MuxSender<T>>,
+    dispatcher: MuxDispatcher<T>,
+    sender: MuxSender<T>,
+    timer: MuxTimer<T>,
 }
 
 impl<T: TokioConn> Future for MuxWorker<T> {
     type Output = MuxResult<()>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let (res, _) = ready!(self.select_fut.poll_unpin(cx)).factor_first();
-        Poll::Ready(res)
+        if self.sender.poll_unpin(cx)?.is_ready() {
+            return Poll::Ready(Ok(()));
+        }
+        if self.timer.poll_unpin(cx)?.is_ready() {
+            return Poll::Ready(Ok(()));
+        }
+        if self.dispatcher.poll_unpin(cx)?.is_ready() {
+            return Poll::Ready(Ok(()));
+        }
+
+        Poll::Pending
     }
 }
 
@@ -323,10 +422,14 @@ impl<T: TokioConn> AsyncWrite for MuxStream<T> {
             }
 
             state.process_finish(self.stream_id);
-            let frame = MuxFrame::new(MuxCommand::Finish, self.stream_id, Bytes::new());
-            state.enqueue_frame_stream(self.stream_id, frame);
-            state.wake_tx();
+            state.send_finish(self.stream_id);
         }
+    }
+}
+
+impl<T: TokioConn> MuxStream<T> {
+    pub fn is_closed(&mut self) -> bool {
+        !self.state.lock().is_open(self.stream_id)
     }
 }
 
@@ -338,9 +441,22 @@ struct StreamHandle {
 
     rx_queue: VecDeque<MuxFrame>,
     rx_waker: Option<Waker>,
+
+    last_active: u64,
 }
 
 impl StreamHandle {
+    fn new(ts: u64) -> Self {
+        Self {
+            closed: false,
+            tx_queue: VecDeque::with_capacity(128),
+            tx_waker: None,
+            rx_queue: VecDeque::with_capacity(128),
+            rx_waker: None,
+            last_active: ts,
+        }
+    }
+
     #[inline]
     fn register_tx_waker(&mut self, cx: &Context<'_>) {
         self.tx_waker = Some(cx.waker().clone());
@@ -382,6 +498,8 @@ struct MuxState<T: TokioConn> {
 
     stream_id_hint: Wrapping<u32>,
     stream_id_type: StreamIdType,
+
+    timestamp: Arc<AtomicU64>,
 }
 
 impl<T: TokioConn> MuxState<T> {
@@ -391,7 +509,7 @@ impl<T: TokioConn> MuxState<T> {
         }
 
         while self.handles.contains_key(&self.stream_id_hint.0) {
-            self.stream_id_hint.0 += 2;
+            self.stream_id_hint += 2;
         }
 
         Ok(self.stream_id_hint.0)
@@ -420,15 +538,7 @@ impl<T: TokioConn> MuxState<T> {
             ));
         }
 
-        let handle = StreamHandle {
-            closed: false,
-
-            tx_queue: VecDeque::with_capacity(128),
-            tx_waker: None,
-
-            rx_queue: VecDeque::with_capacity(128),
-            rx_waker: None,
-        };
+        let handle = StreamHandle::new(self.get_timestamp());
         self.handles.insert(stream_id, handle);
         Ok(())
     }
@@ -442,9 +552,11 @@ impl<T: TokioConn> MuxState<T> {
     }
 
     fn process_push(&mut self, frame: MuxFrame) -> bool {
+        let ts = self.get_timestamp();
         if let Some(handle) = self.handles.get_mut(&frame.header.stream_id) {
             handle.rx_queue.push_back(frame);
             handle.wake_rx();
+            handle.last_active = ts;
             true
         } else {
             false
@@ -510,12 +622,16 @@ impl<T: TokioConn> MuxState<T> {
         }
     }
 
+    #[inline]
+    fn get_timestamp(&self) -> u64 {
+        self.timestamp.load(Ordering::Relaxed)
+    }
+
     fn enqueue_frame_stream(&mut self, stream_id: u32, frame: MuxFrame) {
-        self.handles
-            .get_mut(&stream_id)
-            .unwrap()
-            .tx_queue
-            .push_back(frame)
+        let ts = self.get_timestamp();
+        let handle = self.handles.get_mut(&stream_id).unwrap();
+        handle.tx_queue.push_back(frame);
+        handle.last_active = ts;
     }
 
     #[inline]

@@ -6,11 +6,13 @@ pub mod error;
 pub(crate) mod frame;
 pub(crate) mod mux;
 
+pub use builder::MuxBuilder;
+pub use config::{MuxConfig, StreamIdType};
 pub use mux::{mux_connection, MuxAcceptor, MuxConnector, MuxStream};
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{num::NonZeroU64, time::Duration};
 
     use rand::RngCore;
     use tokio::{
@@ -198,5 +200,32 @@ mod tests {
         assert!(buf == data);
         stream2.read_exact(&mut buf).await.unwrap_err();
         stream2.write_all(&data).await.unwrap_err();
+    }
+
+    #[tokio::test]
+    async fn test_timeout() {
+        let (a, b) = get_tcp_pair().await;
+        let (connector_a, _, worker_a) = MuxBuilder::client()
+            .with_idle_timeout(NonZeroU64::new(3).unwrap())
+            .with_connection(a)
+            .build();
+        let (_, mut acceptor_b, worker_b) = MuxBuilder::server().with_connection(b).build();
+        tokio::spawn(async move {
+            worker_a.await.unwrap();
+        });
+        tokio::spawn(async move {
+            worker_b.await.unwrap();
+        });
+
+        let mut stream1 = connector_a.connect().unwrap();
+        let mut stream2 = acceptor_b.accept().await.unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(!stream1.is_closed());
+        assert!(!stream2.is_closed());
+
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        assert!(stream1.is_closed());
+        assert!(stream2.is_closed());
     }
 }
