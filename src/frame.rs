@@ -44,8 +44,8 @@ impl MuxFrameHeader {
     fn encode(&self, buf: &mut BytesMut) {
         buf.put_u8(self.version);
         buf.put_u8(self.command as u8);
-        buf.put_u16(self.length);
-        buf.put_u32(self.stream_id);
+        buf.put_u16_le(self.length);
+        buf.put_u32_le(self.stream_id);
     }
 
     #[inline]
@@ -56,8 +56,8 @@ impl MuxFrameHeader {
             return Err(MuxError::InvalidVersion(version));
         }
         let command = MuxCommand::try_from(cursor.get_u8())?;
-        let length = cursor.get_u16();
-        let stream_id = cursor.get_u32();
+        let length = cursor.get_u16_le();
+        let stream_id = cursor.get_u32_le();
         Ok(Self {
             version,
             command,
