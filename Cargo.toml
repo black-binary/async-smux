@@ -1,6 +1,6 @@
 [package]
 name = "async_smux"
-version = "0.2.1"
+version = "0.3.0"
 authors = ["black-binary <blackbinary@qq.com>"]
 description = "Asynchronous smux multiplexing library"
 license = "MIT"
