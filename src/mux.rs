@@ -12,13 +12,12 @@ use std::{
 };
 
 use bytes::{Buf, Bytes};
-use futures::{ready, Future, FutureExt, SinkExt, Stream, StreamExt};
+use futures::{future::poll_fn, ready, Future, FutureExt, SinkExt, Stream, StreamExt};
 use futures_sink::Sink;
 use parking_lot::Mutex;
 use std::io as StdIo;
 use tokio::{
     io::{self, AsyncRead, AsyncWrite},
-    macros::support::poll_fn,
     time::{interval, Interval},
 };
 use tokio_util::codec::Framed;
