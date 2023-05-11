@@ -441,6 +441,10 @@ impl<T: TokioConn> MuxStream<T> {
     pub fn is_closed(&mut self) -> bool {
         self.state.lock().is_closed(self.stream_id)
     }
+
+    pub fn get_stream_id(&self) -> u32 {
+        self.stream_id
+    }
 }
 
 struct StreamHandle {
@@ -528,8 +532,12 @@ impl<T: TokioConn> MuxState<T> {
             return Err(MuxError::TooManyStreams);
         }
 
-        while self.handles.contains_key(&self.stream_id_hint.0) {
+        loop {
             self.stream_id_hint += 2;
+
+            if !self.handles.contains_key(&self.stream_id_hint.0) {
+                break;
+            }
         }
 
         Ok(self.stream_id_hint.0)

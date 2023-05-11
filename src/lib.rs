@@ -1,4 +1,35 @@
-//! A lightweight asynchronous [smux](https://github.com/xtaci/smux) (Simple MUltipleXing) library for smol, async-std and any async runtime compatible to `futures`.
+//! A lightweight and fast asynchronous [smux](https://github.com/xtaci/smux) (Simple MUltipleXing) library for Tokio async runtime.
+//! # Quickstart
+//!
+//! ```ignore
+//! ## Server
+//! // Initialize a stream with `AsyncRead + AsyncWrite`, e.g. TcpStream
+//! let tcp_connection = ...
+//! // Spawn a smux server to multiplexing the tcp stream using `MuxBuilder`
+//! let connector, acceptor, worker = MuxBuilder::server().with_connection(tcp_connection).build();
+//! // Spawn the smux worker (or a worker `future`, more precisely)
+//! // The worker keeps running and dispatch smux frames until you drop (or close) all streams, acceptors and connectors
+//! tokio::spawn(worker);
+//!
+//! // Now we are ready to go!
+//! // Both client and server can spawn and accept bi-directional streams
+//! let outgoing_stream = connector.connect().unwrap();
+//! let incoming_stream = connector.accept().await.unwrap();
+//!
+//! // Just use these smux streams like normal tcp streams :)
+//! incoming_stream.read(...).await.unwrap();
+//! incoming_stream.write_all(...).await.unwrap();
+//! ```
+//! ## Client
+//! ```ignore
+//! let tcp_connection = ...
+//! // Just like what we do at the server side, except that we are calling the `client()` function this time
+//! let (connector, acceptor, worker) = MuxBuilder::client().with_connection(tcp_connection).build();
+//! tokio::spawn(worker);
+//!
+//! let outgoing_stream1 = connector.connect().unwrap();
+//! ...
+//! ```
 
 pub mod builder;
 pub mod config;
@@ -76,12 +107,8 @@ mod tests {
             MuxBuilder::client().with_connection(a).build();
         let (connector_b, mut acceptor_b, worker_b) =
             MuxBuilder::server().with_connection(b).build();
-        tokio::spawn(async move {
-            worker_a.await.unwrap();
-        });
-        tokio::spawn(async move {
-            worker_b.await.unwrap();
-        });
+        tokio::spawn(worker_a);
+        tokio::spawn(worker_b);
 
         let stream1 = connector_a.connect().unwrap();
         let stream2 = acceptor_b.accept().await.unwrap();
@@ -153,12 +180,8 @@ mod tests {
         let (connector_a, acceptor_a, worker_a) = MuxBuilder::client().with_connection(a).build();
         let (connector_b, mut acceptor_b, worker_b) =
             MuxBuilder::server().with_connection(b).build();
-        tokio::spawn(async move {
-            worker_a.await.unwrap();
-        });
-        tokio::spawn(async move {
-            worker_b.await.unwrap();
-        });
+        tokio::spawn(worker_a);
+        tokio::spawn(worker_b);
 
         let mut stream1 = connector_a.connect().unwrap();
         let mut stream2 = acceptor_b.accept().await.unwrap();
