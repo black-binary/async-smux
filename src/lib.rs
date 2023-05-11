@@ -12,11 +12,11 @@ pub use mux::{mux_connection, MuxAcceptor, MuxConnector, MuxStream};
 
 #[cfg(test)]
 mod tests {
-    use std::{num::NonZeroU64, time::Duration};
+    use std::{future::poll_fn, num::NonZeroU64, pin::Pin, task::Poll, time::Duration};
 
     use rand::RngCore;
     use tokio::{
-        io::{AsyncReadExt, AsyncWriteExt},
+        io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf},
         net::{TcpListener, TcpStream},
     };
 
@@ -32,8 +32,6 @@ mod tests {
 
         let b = TcpStream::connect(addr).await.unwrap();
         let a = h.await.unwrap();
-        a.set_nodelay(true).unwrap();
-        b.set_nodelay(true).unwrap();
         (a, b)
     }
 
@@ -95,8 +93,6 @@ mod tests {
 
         assert_eq!(connector_a.get_num_streams(), 0);
         assert_eq!(connector_b.get_num_streams(), 0);
-        assert_eq!(acceptor_a.get_num_streams(), 0);
-        assert_eq!(acceptor_b.get_num_streams(), 0);
 
         let mut streams1 = vec![];
         let mut streams2 = vec![];
@@ -126,8 +122,6 @@ mod tests {
 
         assert_eq!(connector_a.get_num_streams(), 0);
         assert_eq!(connector_b.get_num_streams(), 0);
-        assert_eq!(acceptor_a.get_num_streams(), 0);
-        assert_eq!(acceptor_b.get_num_streams(), 0);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -227,5 +221,60 @@ mod tests {
 
         assert!(stream1.is_closed());
         assert!(stream2.is_closed());
+    }
+
+    #[tokio::test]
+    async fn test_recv_block() {
+        let (a, b) = get_tcp_pair().await;
+        let (connector_a, _, worker_a) = MuxBuilder::client().with_connection(a).build();
+        let (_, mut acceptor_b, worker_b) = MuxBuilder::server()
+            .with_max_rx_queue(12.try_into().unwrap())
+            .with_connection(b)
+            .build();
+        tokio::spawn(async move {
+            worker_a.await.unwrap();
+        });
+        tokio::spawn(async move {
+            worker_b.await.unwrap();
+        });
+
+        let mut stream_x1 = connector_a.connect().unwrap();
+        let mut stream_x2 = acceptor_b.accept().await.unwrap();
+
+        let mut stream_y1 = connector_a.connect().unwrap();
+        let mut stream_y2 = acceptor_b.accept().await.unwrap();
+
+        let data = &[1, 2, 3, 4];
+        for _ in 0..3 {
+            stream_x1.write_all(data).await.unwrap();
+        }
+        // stream_x is full now
+        stream_y1.write_all(data).await.unwrap();
+
+        // stream_y should be blocked unless x incoming bytes is handled
+        poll_fn(|cx| {
+            let mut buf = [0; 128];
+            let mut buf = ReadBuf::new(&mut buf);
+            let res = Pin::new(&mut stream_y2).poll_read(cx, &mut buf);
+            assert!(res.is_pending());
+            Poll::Ready(())
+        })
+        .await;
+
+        let mut buf = [0; 4];
+        for _ in 0..3 {
+            stream_x2.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, data);
+        }
+
+        // stream_y is avaliable now
+        poll_fn(|cx| {
+            let mut buf_arr = [0; 128];
+            let mut buf = ReadBuf::new(&mut buf_arr);
+            let res = Pin::new(&mut stream_y2).poll_read(cx, &mut buf);
+            assert!(res.is_ready());
+            Poll::Ready(())
+        })
+        .await;
     }
 }
