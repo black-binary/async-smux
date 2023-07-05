@@ -300,4 +300,21 @@ mod tests {
         })
         .await;
     }
+
+    #[tokio::test]
+    async fn test_connection_drop() {
+        let (a, b) = get_tcp_pair().await;
+        let (connector_a, _, worker_a) = MuxBuilder::client().with_connection(a).build();
+        let (_, mut acceptor_b, worker_b) = MuxBuilder::server().with_connection(b).build();
+        tokio::spawn(worker_a);
+        tokio::spawn(worker_b);
+
+        let mut _stream1 = connector_a.connect().unwrap();
+        let mut stream2 = acceptor_b.accept().await.unwrap();
+
+        drop(_stream1);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        assert!(stream2.write_all(b"1234").await.is_err());
+    }
 }
