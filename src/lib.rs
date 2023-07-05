@@ -14,7 +14,7 @@
 //! // Now we are ready to go!
 //! // Both client and server can spawn and accept bi-directional streams
 //! let outgoing_stream = connector.connect().unwrap();
-//! let incoming_stream = connector.accept().await.unwrap();
+//! let incoming_stream = acceptor.accept().await.unwrap();
 //!
 //! // Just use these smux streams like normal tcp streams :)
 //! incoming_stream.read(...).await.unwrap();
