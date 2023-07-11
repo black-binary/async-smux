@@ -110,7 +110,7 @@ mod tests {
         tokio::spawn(worker_a);
         tokio::spawn(worker_b);
 
-        let stream1 = connector_a.connect().unwrap();
+        let stream1 = connector_a.clone().connect().unwrap();
         let stream2 = acceptor_b.accept().await.unwrap();
         test_stream(stream1, stream2).await;
 
