@@ -80,7 +80,6 @@ pub fn mux_connection<T: TokioConn>(
     )
 }
 
-#[derive(Clone)]
 pub struct MuxConnector<T: TokioConn> {
     state: Arc<Mutex<MuxState<T>>>,
 }
@@ -116,6 +115,14 @@ impl<T: TokioConn> MuxConnector<T> {
 
     pub fn get_num_streams(&self) -> usize {
         self.state.lock().handles.len()
+    }
+}
+
+impl<T: TokioConn> Clone for MuxConnector<T> {
+    fn clone(&self) -> Self {
+        Self {
+            state: self.state.clone(),
+        }
     }
 }
 
