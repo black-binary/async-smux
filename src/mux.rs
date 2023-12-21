@@ -44,8 +44,8 @@ pub fn mux_connection<T: TokioConn>(
         accept_queue: VecDeque::new(),
         accept_waker: None,
         tx_queue: VecDeque::with_capacity(config.max_tx_queue.get()),
-        tx_waker: None,
-        rx_waker: None,
+        should_tx_waker: None,
+        rx_consumed_waker: None,
         closed: false,
         accept_closed: false,
         stream_id_hint: Wrapping(config.stream_id_type as u32),
@@ -93,7 +93,7 @@ impl<T: TokioConn> MuxConnector<T> {
         state.process_sync(stream_id, Direction::Tx)?;
         let frame = MuxFrame::new(MuxCommand::Sync, stream_id, Bytes::new());
         state.enqueue_frame_global(frame);
-        state.try_wake_tx();
+        state.notify_should_tx();
 
         let stream = MuxStream {
             stream_id,
@@ -195,11 +195,11 @@ impl<T: TokioConn> Future for MuxTimer<T> {
             if let Some(keep_alive_interval) = self.keep_alive_interval {
                 if ts > self.last_ping + keep_alive_interval {
                     state.enqueue_frame_global(MuxFrame::new(MuxCommand::Nop, 0, Bytes::new()));
-                    state.try_wake_tx();
+                    state.notify_should_tx();
                 }
             }
 
-            // Clean timeout
+            // Clean timeout streams
             if let Some(idle_timeout) = self.idle_timeout {
                 let dead_ids = state
                     .handles
@@ -216,6 +216,7 @@ impl<T: TokioConn> Future for MuxTimer<T> {
                 for stream_id in dead_ids {
                     state.try_mark_finish(stream_id);
                     state.send_finish(stream_id);
+                    state.notify_rx_consumed();
                 }
             }
         }
@@ -234,7 +235,7 @@ impl<T: TokioConn> Future for MuxSender<T> {
             let mut state = self.state.lock();
             ready!(state.poll_flush_frames(cx))?;
             ready!(state.poll_flush_inner(cx))?;
-            ready!(state.poll_ready_tx(cx))?;
+            ready!(state.poll_should_tx(cx))?;
         }
     }
 }
@@ -265,7 +266,7 @@ impl<T: TokioConn> Future for MuxDispatcher<T> {
                 return Poll::Ready(Ok(()));
             }
 
-            ready!(state.poll_ready_rx(cx));
+            ready!(state.poll_ready_rx_consumed(cx));
 
             let frame = ready!(state.poll_next_frame(cx))?;
             match frame.header.command {
@@ -283,7 +284,7 @@ impl<T: TokioConn> Future for MuxDispatcher<T> {
                         read_buffer: None,
                     };
                     state.accept_queue.push_back(stream);
-                    state.try_wake_accept();
+                    state.notify_accept_stream();
                 }
                 MuxCommand::Finish => {
                     state.try_mark_finish(frame.header.stream_id);
@@ -312,13 +313,13 @@ impl<T: TokioConn> Future for MuxWorker<T> {
     type Output = MuxResult<()>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if self.sender.poll_unpin(cx)?.is_ready() {
-            return Poll::Ready(Ok(()));
-        }
         if self.timer.poll_unpin(cx)?.is_ready() {
             return Poll::Ready(Ok(()));
         }
         if self.dispatcher.poll_unpin(cx)?.is_ready() {
+            return Poll::Ready(Ok(()));
+        }
+        if self.sender.poll_unpin(cx)?.is_ready() {
             return Poll::Ready(Ok(()));
         }
 
@@ -342,7 +343,7 @@ impl<T: TokioConn> Drop for MuxStream<T> {
                 self.stream_id,
                 Bytes::new(),
             ));
-            state.try_wake_tx();
+            state.notify_should_tx();
         }
         state.remove_stream(self.stream_id);
     }
@@ -408,7 +409,7 @@ impl<T: TokioConn> AsyncWrite for MuxStream<T> {
             let frame = MuxFrame::new(MuxCommand::Push, self.stream_id, payload);
             state.enqueue_frame_stream(self.stream_id, frame);
         }
-        state.try_wake_tx();
+        state.notify_should_tx();
         Poll::Ready(Ok(buf.len()))
     }
 
@@ -458,10 +459,10 @@ struct StreamHandle {
     closed: bool,
 
     tx_queue: VecDeque<MuxFrame>,
-    tx_waker: Option<Waker>,
+    tx_done_waker: Option<Waker>,
 
     rx_queue: VecDeque<MuxFrame>,
-    rx_waker: Option<Waker>,
+    rx_ready_waker: Option<Waker>,
 
     last_active: u64,
 }
@@ -471,33 +472,33 @@ impl StreamHandle {
         Self {
             closed: false,
             tx_queue: VecDeque::with_capacity(128),
-            tx_waker: None,
+            tx_done_waker: None,
             rx_queue: VecDeque::with_capacity(128),
-            rx_waker: None,
+            rx_ready_waker: None,
             last_active: ts,
         }
     }
 
     #[inline]
-    fn register_tx_waker(&mut self, cx: &Context<'_>) {
-        self.tx_waker = Some(cx.waker().clone());
+    fn register_tx_done_waker(&mut self, cx: &Context<'_>) {
+        self.tx_done_waker = Some(cx.waker().clone());
     }
 
     #[inline]
-    fn register_rx_waker(&mut self, cx: &Context<'_>) {
-        self.rx_waker = Some(cx.waker().clone());
+    fn register_rx_ready_waker(&mut self, cx: &Context<'_>) {
+        self.rx_ready_waker = Some(cx.waker().clone());
     }
 
     #[inline]
-    fn try_wake_rx(&mut self) {
-        if let Some(waker) = self.rx_waker.take() {
+    fn notify_rx_ready(&mut self) {
+        if let Some(waker) = self.rx_ready_waker.take() {
             waker.wake();
         }
     }
 
     #[inline]
-    fn try_wake_tx(&mut self) {
-        if let Some(waker) = self.tx_waker.take() {
+    fn notify_tx_done(&mut self) {
+        if let Some(waker) = self.tx_done_waker.take() {
             waker.wake();
         }
     }
@@ -517,9 +518,8 @@ struct MuxState<T: TokioConn> {
     accept_waker: Option<Waker>,
 
     tx_queue: VecDeque<MuxFrame>,
-    tx_waker: Option<Waker>,
-
-    rx_waker: Option<Waker>,
+    should_tx_waker: Option<Waker>,
+    rx_consumed_waker: Option<Waker>,
 
     closed: bool,
     accept_closed: bool,
@@ -557,7 +557,7 @@ impl<T: TokioConn> MuxState<T> {
 
     fn send_finish(&mut self, stream_id: u32) {
         self.enqueue_frame_global(MuxFrame::new(MuxCommand::Finish, stream_id, Bytes::new()));
-        self.try_wake_tx();
+        self.notify_should_tx();
     }
 
     fn process_sync(&mut self, stream_id: u32, dir: Direction) -> MuxResult<()> {
@@ -582,8 +582,8 @@ impl<T: TokioConn> MuxState<T> {
     fn try_mark_finish(&mut self, stream_id: u32) {
         if let Some(h) = self.handles.get_mut(&stream_id) {
             h.closed = true;
-            h.try_wake_rx();
-            h.try_wake_tx();
+            h.notify_rx_ready();
+            h.notify_tx_done();
         }
     }
 
@@ -591,7 +591,7 @@ impl<T: TokioConn> MuxState<T> {
         let ts = self.get_timestamp();
         if let Some(handle) = self.handles.get_mut(&frame.header.stream_id) {
             handle.rx_queue.push_back(frame);
-            handle.try_wake_rx();
+            handle.notify_rx_ready();
             handle.last_active = ts;
             true
         } else {
@@ -608,10 +608,10 @@ impl<T: TokioConn> MuxState<T> {
             .sum()
     }
 
-    fn poll_ready_rx(&mut self, cx: &Context<'_>) -> Poll<()> {
+    fn poll_ready_rx_consumed(&mut self, cx: &Context<'_>) -> Poll<()> {
         let pending = self.get_rx_pending();
         if pending > self.max_rx_queue {
-            self.register_rx_waker(cx);
+            self.register_rx_consumed_waker(cx);
             Poll::Pending
         } else {
             Poll::Ready(())
@@ -662,12 +662,13 @@ impl<T: TokioConn> MuxState<T> {
     ) -> Poll<MuxResult<MuxFrame>> {
         let handle = self.handles.get_mut(&stream_id).unwrap();
         if let Some(f) = handle.rx_queue.pop_front() {
-            self.try_wake_rx(); // Rx queue packet consumed
+            self.notify_rx_consumed(); // Rx queue packet consumed
             Poll::Ready(Ok(f))
         } else if handle.closed {
             Poll::Ready(Err(MuxError::StreamClosed(stream_id)))
         } else {
-            handle.register_rx_waker(cx);
+            // No further packets, just wait
+            handle.register_rx_ready_waker(cx);
             Poll::Pending
         }
     }
@@ -680,7 +681,10 @@ impl<T: TokioConn> MuxState<T> {
     fn poll_stream_write_ready(&mut self, cx: &Context<'_>, stream_id: u32) -> Poll<()> {
         let handle = self.handles.get_mut(&stream_id).unwrap();
         if handle.tx_queue.len() > self.max_tx_queue {
-            handle.register_tx_waker(cx);
+            // A stream's tx queue is full
+            handle.register_tx_done_waker(cx);
+            // Notify the worker to transfer data now
+            self.notify_should_tx();
             Poll::Pending
         } else {
             Poll::Ready(())
@@ -700,25 +704,25 @@ impl<T: TokioConn> MuxState<T> {
     }
 
     #[inline]
-    fn register_tx_waker(&mut self, cx: &Context<'_>) {
-        self.tx_waker = Some(cx.waker().clone());
+    fn register_should_tx_waker(&mut self, cx: &Context<'_>) {
+        self.should_tx_waker = Some(cx.waker().clone());
     }
 
     #[inline]
-    fn register_rx_waker(&mut self, cx: &Context<'_>) {
-        self.rx_waker = Some(cx.waker().clone());
+    fn register_rx_consumed_waker(&mut self, cx: &Context<'_>) {
+        self.rx_consumed_waker = Some(cx.waker().clone());
     }
 
     #[inline]
-    fn try_wake_tx(&mut self) {
-        if let Some(waker) = self.tx_waker.take() {
+    fn notify_should_tx(&mut self) {
+        if let Some(waker) = self.should_tx_waker.take() {
             waker.wake();
         }
     }
 
     #[inline]
-    fn try_wake_rx(&mut self) {
-        if let Some(waker) = self.rx_waker.take() {
+    fn notify_rx_consumed(&mut self) {
+        if let Some(waker) = self.rx_consumed_waker.take() {
             waker.wake();
         }
     }
@@ -732,8 +736,8 @@ impl<T: TokioConn> MuxState<T> {
         if handle.tx_queue.is_empty() {
             Poll::Ready(Ok(()))
         } else {
-            handle.register_tx_waker(cx);
-            self.try_wake_tx();
+            handle.register_tx_done_waker(cx);
+            self.notify_should_tx();
             Poll::Pending
         }
     }
@@ -744,7 +748,7 @@ impl<T: TokioConn> MuxState<T> {
     }
 
     #[inline]
-    fn try_wake_accept(&mut self) {
+    fn notify_accept_stream(&mut self) {
         if let Some(waker) = self.accept_waker.take() {
             waker.wake();
         }
@@ -752,11 +756,11 @@ impl<T: TokioConn> MuxState<T> {
 
     fn close(&mut self) {
         self.closed = true;
-        self.try_wake_accept();
+        self.notify_accept_stream();
         for (_, h) in self.handles.iter_mut() {
             h.closed = true;
-            h.try_wake_rx();
-            h.try_wake_tx();
+            h.notify_rx_ready();
+            h.notify_tx_done();
         }
     }
 
@@ -769,14 +773,16 @@ impl<T: TokioConn> MuxState<T> {
     }
 
     fn poll_flush_frames(&mut self, cx: &mut Context<'_>) -> Poll<MuxResult<()>> {
-        // Global
+        // Global queue
+        // Flush control frames first
         while !self.tx_queue.is_empty() {
             ready!(self.poll_write_ready(cx))?;
             let frame = self.tx_queue.pop_front().unwrap();
             self.write_frame(frame)?;
         }
 
-        // Streams
+        // Stream queues
+        // Flush pending stream packets
         for (_, h) in self
             .handles
             .iter_mut()
@@ -785,7 +791,7 @@ impl<T: TokioConn> MuxState<T> {
             while !h.tx_queue.is_empty() {
                 ready!(Pin::new(&mut self.inner).poll_ready(cx))?;
                 Pin::new(&mut self.inner).start_send(h.tx_queue.pop_front().unwrap())?;
-                h.try_wake_tx();
+                h.notify_tx_done();
             }
         }
 
@@ -796,11 +802,11 @@ impl<T: TokioConn> MuxState<T> {
         self.inner.poll_flush_unpin(cx)
     }
 
-    fn poll_ready_tx(&mut self, cx: &mut Context<'_>) -> Poll<MuxResult<()>> {
+    fn poll_should_tx(&mut self, cx: &mut Context<'_>) -> Poll<MuxResult<()>> {
         self.check_closed()?;
 
         if self.tx_queue.is_empty() && self.handles.iter().all(|(_, h)| h.tx_queue.is_empty()) {
-            self.register_tx_waker(cx);
+            self.register_should_tx_waker(cx);
             Poll::Pending
         } else {
             Poll::Ready(Ok(()))

@@ -14,7 +14,7 @@ bytes = "1.2"
 rand = "0.8"
 log = "0.4"
 parking_lot = "0.12"
-pin-project = "1.0"
+pin-project = "1.1"
 thiserror = "1.0"
 futures-sink = "0.3"
 
