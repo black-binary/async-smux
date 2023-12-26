@@ -626,10 +626,7 @@ impl<T: TokioConn> MuxState<T> {
         self.check_closed()?;
 
         if let Some(r) = ready!(self.inner.poll_next_unpin(cx)) {
-            let frame = r.map_err(|e| {
-                self.close();
-                e
-            })?;
+            let frame = r.inspect_err(|_| self.close())?;
             Poll::Ready(Ok(frame))
         } else {
             self.close();

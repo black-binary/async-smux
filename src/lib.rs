@@ -317,4 +317,29 @@ mod tests {
 
         assert!(stream2.write_all(b"1234").await.is_err());
     }
+
+    #[tokio::test]
+    async fn test_inner_shutdown() {
+        let (a, b) = get_tcp_pair().await;
+
+        let (connector_a, mut acceptor_a, worker_a) =
+            MuxBuilder::client().with_connection(a).build();
+        let (connector_b, mut acceptor_b, worker_b) =
+            MuxBuilder::server().with_connection(b).build();
+
+        let a_res = tokio::spawn(worker_a);
+        drop(worker_b);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        assert!(connector_b.connect().is_err());
+        assert!(acceptor_b.accept().await.is_none());
+
+        drop(connector_b);
+        drop(acceptor_b);
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(connector_a.connect().is_err());
+        assert!(acceptor_a.accept().await.is_none());
+        a_res.await.unwrap().unwrap_err();
+    }
 }

@@ -95,6 +95,8 @@ impl Decoder for MuxCodec {
     type Error = MuxError;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        src.reserve(HEADER_SIZE + MAX_PAYLOAD_SIZE + HEADER_SIZE);
+
         if src.len() < HEADER_SIZE {
             return Ok(None);
         }
