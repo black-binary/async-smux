@@ -234,6 +234,7 @@ impl<T: TokioConn> Future for MuxSender<T> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         loop {
             let mut state = self.state.lock();
+            state.check_closed()?;
             ready!(state.poll_flush_frames(cx)).inspect_err(|_| state.close())?;
             ready!(state.poll_flush_inner(cx)).inspect_err(|_| state.close())?;
             ready!(state.poll_should_tx(cx));
