@@ -14,6 +14,7 @@ use std::{
 use bytes::{Buf, Bytes};
 use futures::{future::poll_fn, ready, Future, FutureExt, SinkExt, Stream, StreamExt};
 use futures_sink::Sink;
+use log::debug;
 use parking_lot::Mutex;
 use std::io as StdIo;
 use tokio::{
@@ -233,9 +234,9 @@ impl<T: TokioConn> Future for MuxSender<T> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         loop {
             let mut state = self.state.lock();
-            ready!(state.poll_flush_frames(cx))?;
-            ready!(state.poll_flush_inner(cx))?;
-            ready!(state.poll_should_tx(cx))?;
+            ready!(state.poll_flush_frames(cx)).inspect_err(|_| state.close())?;
+            ready!(state.poll_flush_inner(cx)).inspect_err(|_| state.close())?;
+            ready!(state.poll_should_tx(cx));
         }
     }
 }
@@ -262,13 +263,11 @@ impl<T: TokioConn> Future for MuxDispatcher<T> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         loop {
             let mut state = self.state.lock();
-            if state.check_closed().is_err() {
-                return Poll::Ready(Ok(()));
-            }
+            state.check_closed()?;
 
             ready!(state.poll_ready_rx_consumed(cx));
 
-            let frame = ready!(state.poll_next_frame(cx))?;
+            let frame = ready!(state.poll_next_frame(cx)).inspect_err(|_| state.close())?;
             match frame.header.command {
                 MuxCommand::Sync => {
                     if state.accept_closed {
@@ -313,9 +312,8 @@ impl<T: TokioConn> Future for MuxWorker<T> {
     type Output = MuxResult<()>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if self.timer.poll_unpin(cx)?.is_ready() {
-            return Poll::Ready(Ok(()));
-        }
+        let _ = self.timer.poll_unpin(cx);
+
         if self.dispatcher.poll_unpin(cx)?.is_ready() {
             return Poll::Ready(Ok(()));
         }
@@ -370,8 +368,14 @@ impl<T: TokioConn> AsyncRead for MuxStream<T> {
 
             let frame = ready!(self.state.lock().poll_read_stream_data(cx, self.stream_id))
                 .map_err(mux_to_io_err)?;
-            debug_assert_eq!(frame.header.command, MuxCommand::Push);
-            self.read_buffer = Some(frame.payload);
+
+            if let Some(frame) = frame {
+                debug_assert_eq!(frame.header.command, MuxCommand::Push);
+                self.read_buffer = Some(frame.payload);
+            } else {
+                // EOF
+                return Poll::Ready(Ok(()));
+            }
         }
     }
 }
@@ -400,7 +404,7 @@ impl<T: TokioConn> AsyncWrite for MuxStream<T> {
             )));
         }
 
-        ready!(state.poll_stream_write_ready(cx, self.stream_id));
+        ready!(state.poll_stream_write_ready(cx, self.stream_id)).map_err(mux_to_io_err)?;
 
         let mut write_buffer = Bytes::copy_from_slice(buf);
         while !write_buffer.is_empty() {
@@ -430,7 +434,6 @@ impl<T: TokioConn> AsyncWrite for MuxStream<T> {
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), StdIo::Error>> {
         loop {
             let mut state = self.state.lock();
-            state.check_closed().map_err(mux_to_io_err)?;
             ready!(state
                 .poll_flush_stream_frames(cx, self.stream_id)
                 .map_err(mux_to_io_err))?;
@@ -533,6 +536,12 @@ struct MuxState<T: TokioConn> {
     max_rx_queue: usize,
 }
 
+impl<T: TokioConn> Drop for MuxState<T> {
+    fn drop(&mut self) {
+        debug!("mux state dropped");
+    }
+}
+
 impl<T: TokioConn> MuxState<T> {
     fn alloc_stream_id(&mut self) -> MuxResult<u32> {
         if self.handles.len() >= (u32::MAX / 2) as usize {
@@ -626,10 +635,9 @@ impl<T: TokioConn> MuxState<T> {
         self.check_closed()?;
 
         if let Some(r) = ready!(self.inner.poll_next_unpin(cx)) {
-            let frame = r.inspect_err(|_| self.close())?;
+            let frame = r?;
             Poll::Ready(Ok(frame))
         } else {
-            self.close();
             Poll::Ready(Err(MuxError::ConnectionClosed))
         }
     }
@@ -640,10 +648,7 @@ impl<T: TokioConn> MuxState<T> {
     }
 
     fn poll_write_ready(&mut self, cx: &mut Context<'_>) -> Poll<MuxResult<()>> {
-        ready!(self.pin_inner().poll_ready(cx)).map_err(|e| {
-            self.close();
-            e
-        })?;
+        ready!(self.pin_inner().poll_ready(cx))?;
         Poll::Ready(Ok(()))
     }
 
@@ -656,13 +661,16 @@ impl<T: TokioConn> MuxState<T> {
         &mut self,
         cx: &mut Context<'_>,
         stream_id: u32,
-    ) -> Poll<MuxResult<MuxFrame>> {
+    ) -> Poll<MuxResult<Option<MuxFrame>>> {
         let handle = self.handles.get_mut(&stream_id).unwrap();
         if let Some(f) = handle.rx_queue.pop_front() {
             self.notify_rx_consumed(); // Rx queue packet consumed
-            Poll::Ready(Ok(f))
+            Poll::Ready(Ok(Some(f)))
+        } else if self.closed {
+            Poll::Ready(Err(MuxError::ConnectionClosed))
         } else if handle.closed {
-            Poll::Ready(Err(MuxError::StreamClosed(stream_id)))
+            // EOF
+            Poll::Ready(Ok(None))
         } else {
             // No further packets, just wait
             handle.register_rx_ready_waker(cx);
@@ -675,7 +683,8 @@ impl<T: TokioConn> MuxState<T> {
         self.timestamp.load(Ordering::Relaxed)
     }
 
-    fn poll_stream_write_ready(&mut self, cx: &Context<'_>, stream_id: u32) -> Poll<()> {
+    fn poll_stream_write_ready(&mut self, cx: &Context<'_>, stream_id: u32) -> Poll<MuxResult<()>> {
+        self.check_closed()?;
         let handle = self.handles.get_mut(&stream_id).unwrap();
         if handle.tx_queue.len() > self.max_tx_queue {
             // A stream's tx queue is full
@@ -684,7 +693,7 @@ impl<T: TokioConn> MuxState<T> {
             self.notify_should_tx();
             Poll::Pending
         } else {
-            Poll::Ready(())
+            Poll::Ready(Ok(()))
         }
     }
 
@@ -729,6 +738,7 @@ impl<T: TokioConn> MuxState<T> {
         cx: &mut Context<'_>,
         stream_id: u32,
     ) -> Poll<MuxResult<()>> {
+        self.check_closed()?;
         let handle = self.handles.get_mut(&stream_id).unwrap();
         if handle.tx_queue.is_empty() {
             Poll::Ready(Ok(()))
@@ -753,7 +763,10 @@ impl<T: TokioConn> MuxState<T> {
 
     fn close(&mut self) {
         self.closed = true;
+        // Wake up everyone
         self.notify_accept_stream();
+        self.notify_rx_consumed();
+        self.notify_should_tx();
         for (_, h) in self.handles.iter_mut() {
             h.closed = true;
             h.notify_rx_ready();
@@ -799,14 +812,12 @@ impl<T: TokioConn> MuxState<T> {
         self.inner.poll_flush_unpin(cx)
     }
 
-    fn poll_should_tx(&mut self, cx: &mut Context<'_>) -> Poll<MuxResult<()>> {
-        self.check_closed()?;
-
+    fn poll_should_tx(&mut self, cx: &mut Context<'_>) -> Poll<()> {
         if self.tx_queue.is_empty() && self.handles.iter().all(|(_, h)| h.tx_queue.is_empty()) {
             self.register_should_tx_waker(cx);
             Poll::Pending
         } else {
-            Poll::Ready(Ok(()))
+            Poll::Ready(())
         }
     }
 }

@@ -196,12 +196,12 @@ mod tests {
         stream1.flush().await.unwrap_err();
         let mut buf = vec![0; 4];
         stream1.read_exact(&mut buf).await.unwrap();
-        assert!(buf == data);
-        stream1.read(&mut buf).await.unwrap_err();
+        assert_eq!(buf, data);
+        assert_eq!(stream1.read(&mut buf).await.unwrap(), 0);
 
         drop(acceptor_a);
         let mut stream = connector_b.connect().unwrap();
-        stream.read(&mut buf).await.unwrap_err();
+        assert_eq!(stream.read(&mut buf).await.unwrap(), 0);
         stream.flush().await.unwrap_err();
         stream.shutdown().await.unwrap();
 
