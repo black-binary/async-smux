@@ -29,8 +29,8 @@ impl MuxBuilder<Begin> {
                     stream_id_type: StreamIdType::Odd,
                     keep_alive_interval: None,
                     idle_timeout: None,
-                    max_tx_queue: NonZeroUsize::new(512).unwrap(),
-                    max_rx_queue: NonZeroUsize::new(512).unwrap(),
+                    max_tx_queue: NonZeroUsize::new(1024).unwrap(),
+                    max_rx_queue: NonZeroUsize::new(1024).unwrap(),
                 },
             },
         }
@@ -43,8 +43,8 @@ impl MuxBuilder<Begin> {
                     stream_id_type: StreamIdType::Even,
                     keep_alive_interval: None,
                     idle_timeout: None,
-                    max_tx_queue: NonZeroUsize::new(512).unwrap(),
-                    max_rx_queue: NonZeroUsize::new(512).unwrap(),
+                    max_tx_queue: NonZeroUsize::new(1024).unwrap(),
+                    max_rx_queue: NonZeroUsize::new(1024).unwrap(),
                 },
             },
         }

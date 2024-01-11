@@ -266,7 +266,7 @@ impl<T: TokioConn> Future for MuxDispatcher<T> {
             let mut state = self.state.lock();
             state.check_closed()?;
 
-            ready!(state.poll_ready_rx_consumed(cx));
+            ready!(state.poll_ready_rx_consumed(cx)); // Can stuck here forever, be careful
 
             let frame = ready!(state.poll_next_frame(cx)).inspect_err(|_| state.close())?;
             match frame.header.command {
@@ -318,6 +318,7 @@ impl<T: TokioConn> Future for MuxWorker<T> {
         if self.dispatcher.poll_unpin(cx)?.is_ready() {
             return Poll::Ready(Ok(()));
         }
+
         if self.sender.poll_unpin(cx)?.is_ready() {
             return Poll::Ready(Ok(()));
         }
@@ -563,6 +564,8 @@ impl<T: TokioConn> MuxState<T> {
     #[inline]
     fn remove_stream(&mut self, stream_id: u32) {
         self.handles.remove(&stream_id).unwrap();
+        // Rx queue may change
+        self.notify_rx_consumed();
     }
 
     fn send_finish(&mut self, stream_id: u32) {
@@ -633,8 +636,6 @@ impl<T: TokioConn> MuxState<T> {
     }
 
     fn poll_next_frame(&mut self, cx: &mut Context<'_>) -> Poll<MuxResult<MuxFrame>> {
-        self.check_closed()?;
-
         if let Some(r) = ready!(self.inner.poll_next_unpin(cx)) {
             let frame = r?;
             Poll::Ready(Ok(frame))
