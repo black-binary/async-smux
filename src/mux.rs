@@ -73,7 +73,7 @@ pub fn mux_connection<T: TokioConn>(
                 state,
                 interval: interval(Duration::from_millis(500)),
                 timestamp,
-                last_ping: get_timestamp_slow(),
+                last_ping: Arc::new(Mutex::new(get_timestamp_slow())),
                 keep_alive_interval: config.keep_alive_interval.map(|a| a.get()),
                 idle_timeout: config.idle_timeout.map(|a| a.get()),
             },
@@ -174,7 +174,7 @@ struct MuxTimer<T: TokioConn> {
     interval: Interval,
     timestamp: Arc<AtomicU64>,
 
-    last_ping: u64,
+    last_ping: Arc<Mutex<u64>>,
     keep_alive_interval: Option<u64>,
 
     idle_timeout: Option<u64>,
@@ -194,9 +194,11 @@ impl<T: TokioConn> Future for MuxTimer<T> {
 
             // Ping
             if let Some(keep_alive_interval) = self.keep_alive_interval {
-                if ts > self.last_ping + keep_alive_interval {
+                let mut last_ping = self.last_ping.lock();
+                if ts > *last_ping + keep_alive_interval {
                     state.enqueue_frame_global(MuxFrame::new(MuxCommand::Nop, 0, Bytes::new()));
                     state.notify_should_tx();
+                    *last_ping = ts;
                 }
             }
 
