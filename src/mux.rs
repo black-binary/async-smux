@@ -191,10 +191,10 @@ impl<T: TokioConn> Future for MuxTimer<T> {
             let ts = get_timestamp_slow();
             self.timestamp.store(ts, Ordering::SeqCst);
             let mut state = self.state.lock();
-            let mut last_ping = self.last_ping.lock();
 
             // Ping
             if let Some(keep_alive_interval) = self.keep_alive_interval {
+                let mut last_ping = self.last_ping.lock();
                 if ts > *last_ping + keep_alive_interval {
                     state.enqueue_frame_global(MuxFrame::new(MuxCommand::Nop, 0, Bytes::new()));
                     state.notify_should_tx();
