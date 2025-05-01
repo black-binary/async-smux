@@ -3,12 +3,9 @@ use std::{
     io::ErrorKind,
     num::Wrapping,
     pin::Pin,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
+    sync::Arc,
     task::{Context, Poll, Waker},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 use bytes::{Buf, Bytes};
@@ -37,7 +34,6 @@ pub fn mux_connection<T: TokioConn>(
     connection: T,
     config: MuxConfig,
 ) -> (MuxConnector<T>, MuxAcceptor<T>, MuxWorker<T>) {
-    let timestamp = Arc::new(AtomicU64::new(get_timestamp_slow()));
     let inner = Framed::new(connection, MuxCodec {});
     let state = Arc::new(Mutex::new(MuxState {
         inner,
@@ -51,7 +47,7 @@ pub fn mux_connection<T: TokioConn>(
         accept_closed: false,
         stream_id_hint: Wrapping(config.stream_id_type as u32),
         stream_id_type: config.stream_id_type,
-        timestamp: timestamp.clone(),
+        idle_timeout: config.idle_timeout.map_or(1, |num| num.get()),
         max_tx_queue: config.max_tx_queue.get(),
         max_rx_queue: config.max_rx_queue.get(),
     }));
@@ -72,9 +68,8 @@ pub fn mux_connection<T: TokioConn>(
             timer: MuxTimer {
                 state,
                 interval: interval(Duration::from_millis(500)),
-                timestamp,
                 keep_alive_interval: config.keep_alive_interval.map(|a| interval(Duration::from_secs(a.get()))),
-                idle_timeout: config.idle_timeout.map(|a| a.get()),
+                idle_timeout_enabled: config.idle_timeout.is_some(),
             },
         },
     )
@@ -160,22 +155,13 @@ impl<T: TokioConn> Stream for MuxAcceptor<T> {
     }
 }
 
-#[inline]
-fn get_timestamp_slow() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
-}
-
 struct MuxTimer<T: TokioConn> {
     state: Arc<Mutex<MuxState<T>>>,
     interval: Interval,
-    timestamp: Arc<AtomicU64>,
 
     keep_alive_interval: Option<Interval>,
 
-    idle_timeout: Option<u64>,
+    idle_timeout_enabled: bool,
 }
 
 impl<T: TokioConn> Future for MuxTimer<T> {
@@ -196,8 +182,6 @@ impl<T: TokioConn> Future for MuxTimer<T> {
                 }
             }
 
-            let ts = get_timestamp_slow();
-            self.timestamp.store(ts, Ordering::SeqCst);
             let mut state = self.state.lock();
 
             // Ping send
@@ -207,12 +191,12 @@ impl<T: TokioConn> Future for MuxTimer<T> {
             }
 
             // Clean timeout streams
-            if let Some(idle_timeout) = self.idle_timeout {
+            if self.idle_timeout_enabled {
                 let dead_ids = state
                     .handles
-                    .iter()
+                    .iter_mut()
                     .filter_map(|(id, h)| {
-                        if ts > h.last_active + idle_timeout {
+                        if h.idle_interval.poll_tick(cx).is_ready() {
                             Some(*id)
                         } else {
                             None
@@ -475,18 +459,18 @@ struct StreamHandle {
     rx_queue: VecDeque<MuxFrame>,
     rx_ready_waker: Option<Waker>,
 
-    last_active: u64,
+    idle_interval: Interval,
 }
 
 impl StreamHandle {
-    fn new(ts: u64) -> Self {
+    fn new(idle_interval: Interval) -> Self {
         Self {
             closed: false,
             tx_queue: VecDeque::with_capacity(128),
             tx_done_waker: None,
             rx_queue: VecDeque::with_capacity(128),
             rx_ready_waker: None,
-            last_active: ts,
+            idle_interval,
         }
     }
 
@@ -538,7 +522,7 @@ struct MuxState<T: TokioConn> {
     stream_id_hint: Wrapping<u32>,
     stream_id_type: StreamIdType,
 
-    timestamp: Arc<AtomicU64>,
+    idle_timeout: u64,
 
     max_tx_queue: usize,
     max_rx_queue: usize,
@@ -592,7 +576,7 @@ impl<T: TokioConn> MuxState<T> {
             ));
         }
 
-        let handle = StreamHandle::new(self.get_timestamp());
+        let handle = StreamHandle::new(self.get_idle_interval());
         self.handles.insert(stream_id, handle);
         Ok(())
     }
@@ -607,11 +591,10 @@ impl<T: TokioConn> MuxState<T> {
     }
 
     fn recv_push(&mut self, frame: MuxFrame) -> bool {
-        let ts = self.get_timestamp();
         if let Some(handle) = self.handles.get_mut(&frame.header.stream_id) {
             handle.rx_queue.push_back(frame);
             handle.notify_rx_ready();
-            handle.last_active = ts;
+            handle.idle_interval.reset();
             true
         } else {
             false
@@ -687,8 +670,8 @@ impl<T: TokioConn> MuxState<T> {
     }
 
     #[inline]
-    fn get_timestamp(&self) -> u64 {
-        self.timestamp.load(Ordering::Relaxed)
+    fn get_idle_interval(&self) -> Interval {
+        interval(Duration::from_secs(self.idle_timeout))
     }
 
     fn poll_stream_write_ready(&mut self, cx: &Context<'_>, stream_id: u32) -> Poll<MuxResult<()>> {
@@ -706,10 +689,10 @@ impl<T: TokioConn> MuxState<T> {
     }
 
     fn enqueue_frame_stream(&mut self, stream_id: u32, frame: MuxFrame) {
-        let ts = self.get_timestamp();
+        let interval = self.get_idle_interval();
         let handle = self.handles.get_mut(&stream_id).unwrap();
         handle.tx_queue.push_back(frame);
-        handle.last_active = ts;
+        handle.idle_interval = interval;
     }
 
     #[inline]
