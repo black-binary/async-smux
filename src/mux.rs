@@ -73,8 +73,7 @@ pub fn mux_connection<T: TokioConn>(
                 state,
                 interval: interval(Duration::from_millis(500)),
                 timestamp,
-                last_ping: Arc::new(Mutex::new(get_timestamp_slow())),
-                keep_alive_interval: config.keep_alive_interval.map(|a| a.get()),
+                keep_alive_interval: config.keep_alive_interval.map(|a| interval(Duration::from_secs(a.get()))),
                 idle_timeout: config.idle_timeout.map(|a| a.get()),
             },
         },
@@ -174,8 +173,7 @@ struct MuxTimer<T: TokioConn> {
     interval: Interval,
     timestamp: Arc<AtomicU64>,
 
-    last_ping: Arc<Mutex<u64>>,
-    keep_alive_interval: Option<u64>,
+    keep_alive_interval: Option<Interval>,
 
     idle_timeout: Option<u64>,
 }
@@ -188,18 +186,24 @@ impl<T: TokioConn> Future for MuxTimer<T> {
             ready!(self.interval.poll_tick(cx));
             self.interval.reset();
 
+            // Ping check
+            let mut is_ping_send_needs = false;
+            if let Some(keep_alive_interval) = self.keep_alive_interval.as_mut() {
+                if keep_alive_interval.poll_tick(cx).is_ready() {
+                    keep_alive_interval.reset();
+
+                    is_ping_send_needs = true;
+                }
+            }
+
             let ts = get_timestamp_slow();
             self.timestamp.store(ts, Ordering::SeqCst);
             let mut state = self.state.lock();
 
-            // Ping
-            if let Some(keep_alive_interval) = self.keep_alive_interval {
-                let mut last_ping = self.last_ping.lock();
-                if ts > *last_ping + keep_alive_interval {
-                    state.enqueue_frame_global(MuxFrame::new(MuxCommand::Nop, 0, Bytes::new()));
-                    state.notify_should_tx();
-                    *last_ping = ts;
-                }
+            // Ping send
+            if is_ping_send_needs {
+                state.enqueue_frame_global(MuxFrame::new(MuxCommand::Nop, 0, Bytes::new()));
+                state.notify_should_tx();
             }
 
             // Clean timeout streams
