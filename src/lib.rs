@@ -43,7 +43,13 @@ pub use mux::{mux_connection, MuxAcceptor, MuxConnector, MuxStream};
 
 #[cfg(test)]
 mod tests {
-    use std::{future::poll_fn, num::NonZeroU64, pin::Pin, task::Poll, time::Duration};
+    use std::{
+        future::poll_fn,
+        num::{NonZeroU64, NonZeroUsize},
+        pin::Pin,
+        task::Poll,
+        time::Duration,
+    };
 
     use rand::RngCore;
     use tokio::{
@@ -341,5 +347,72 @@ mod tests {
         assert!(connector_a.connect().is_err());
         assert!(acceptor_a.accept().await.is_none());
         a_res.await.unwrap().unwrap_err();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_drop_acceptor_cleans_unaccepted_incoming_streams() {
+        let (a, b) = get_tcp_pair().await;
+        let (connector_a, acceptor_a, worker_a) = MuxBuilder::client()
+            .with_max_rx_queue(NonZeroUsize::new(8).unwrap())
+            .with_connection(a)
+            .build();
+        let (connector_b, mut acceptor_b, worker_b) = MuxBuilder::server()
+            .with_max_rx_queue(NonZeroUsize::new(8).unwrap())
+            .with_connection(b)
+            .build();
+
+        tokio::spawn(worker_a);
+        tokio::spawn(worker_b);
+
+        const N: usize = 3;
+        let mut outbound = Vec::with_capacity(N);
+        for _ in 0..N {
+            outbound.push(connector_b.connect().unwrap());
+        }
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while connector_a.get_num_streams() < N {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        for stream in &mut outbound {
+            for _ in 0..64 {
+                stream.write_all(b"0123456789abcdef").await.unwrap();
+            }
+            stream.flush().await.unwrap();
+        }
+
+        drop(acceptor_a);
+        assert_eq!(connector_a.get_num_streams(), 0);
+
+        let mut c2s = connector_a.connect().unwrap();
+        let mut s2c = acceptor_b.accept().await.unwrap();
+        c2s.write_all(b"ping").await.unwrap();
+        c2s.flush().await.unwrap();
+        let mut buf = [0u8; 4];
+        s2c.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ping");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_drop_all_public_handles_stops_worker() {
+        let (a, b) = get_tcp_pair().await;
+        let (connector_a, acceptor_a, worker_a) = MuxBuilder::client().with_connection(a).build();
+        let (_, _, worker_b) = MuxBuilder::server().with_connection(b).build();
+
+        let h_a = tokio::spawn(worker_a);
+        let _h_b = tokio::spawn(worker_b);
+
+        drop(connector_a);
+        drop(acceptor_a);
+
+        let res = tokio::time::timeout(Duration::from_secs(2), h_a)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(res.is_err());
     }
 }

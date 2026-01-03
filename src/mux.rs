@@ -16,7 +16,7 @@ use parking_lot::Mutex;
 use std::io as StdIo;
 use tokio::{
     io::{self, AsyncRead, AsyncWrite},
-    time::{interval, Interval},
+    time::{interval, Instant, Interval},
 };
 use tokio_util::codec::Framed;
 
@@ -45,12 +45,17 @@ pub fn mux_connection<T: TokioConn>(
         rx_consumed_waker: None,
         closed: false,
         accept_closed: false,
+        public_handles: 0,
         stream_id_hint: Wrapping(config.stream_id_type as u32),
         stream_id_type: config.stream_id_type,
         idle_timeout: config.idle_timeout.map_or(1, |num| num.get()),
         max_tx_queue: config.max_tx_queue.get(),
         max_rx_queue: config.max_rx_queue.get(),
     }));
+    {
+        // Expose 2 public handles: connector + acceptor.
+        state.lock().public_handles = 2;
+    }
     (
         MuxConnector {
             state: state.clone(),
@@ -89,6 +94,7 @@ impl<T: TokioConn> MuxConnector<T> {
         let frame = MuxFrame::new(MuxCommand::Sync, stream_id, Bytes::new());
         state.enqueue_frame_global(frame);
         state.notify_should_tx();
+        state.public_handles += 1;
 
         let stream = MuxStream {
             stream_id,
@@ -115,9 +121,16 @@ impl<T: TokioConn> MuxConnector<T> {
 
 impl<T: TokioConn> Clone for MuxConnector<T> {
     fn clone(&self) -> Self {
+        self.state.lock().public_handles += 1;
         Self {
             state: self.state.clone(),
         }
+    }
+}
+
+impl<T: TokioConn> Drop for MuxConnector<T> {
+    fn drop(&mut self) {
+        self.state.lock().dec_public_handles();
     }
 }
 
@@ -127,7 +140,10 @@ pub struct MuxAcceptor<T: TokioConn> {
 
 impl<T: TokioConn> Drop for MuxAcceptor<T> {
     fn drop(&mut self) {
-        self.state.lock().accept_closed = true;
+        let mut state = self.state.lock();
+        state.accept_closed = true;
+        state.close_unaccepted_streams();
+        state.dec_public_handles();
     }
 }
 
@@ -146,7 +162,13 @@ impl<T: TokioConn> Stream for MuxAcceptor<T> {
             return Poll::Ready(None);
         }
 
-        if let Some(stream) = state.accept_queue.pop_front() {
+        if let Some(stream_id) = state.accept_queue.pop_front() {
+            state.public_handles += 1;
+            let stream = MuxStream {
+                stream_id,
+                state: self.state.clone(),
+                read_buffer: None,
+            };
             Poll::Ready(Some(stream))
         } else {
             state.register_accept_waker(cx);
@@ -192,11 +214,13 @@ impl<T: TokioConn> Future for MuxTimer<T> {
 
             // Clean timeout streams
             if self.idle_timeout_enabled {
+                let now = Instant::now();
+                let timeout = Duration::from_secs(state.idle_timeout);
                 let dead_ids = state
                     .handles
-                    .iter_mut()
+                    .iter()
                     .filter_map(|(id, h)| {
-                        if h.idle_interval.poll_tick(cx).is_ready() {
+                        if now.duration_since(h.last_active) >= timeout {
                             Some(*id)
                         } else {
                             None
@@ -267,13 +291,7 @@ impl<T: TokioConn> Future for MuxDispatcher<T> {
                     }
 
                     state.process_sync(frame.header.stream_id, Direction::Rx)?;
-
-                    let stream = MuxStream {
-                        stream_id: frame.header.stream_id,
-                        state: self.state.clone(),
-                        read_buffer: None,
-                    };
-                    state.accept_queue.push_back(stream);
+                    state.accept_queue.push_back(frame.header.stream_id);
                     state.notify_accept_stream();
                 }
                 MuxCommand::Finish => {
@@ -336,6 +354,7 @@ impl<T: TokioConn> Drop for MuxStream<T> {
             state.notify_should_tx();
         }
         state.remove_stream(self.stream_id);
+        state.dec_public_handles();
     }
 }
 
@@ -459,18 +478,18 @@ struct StreamHandle {
     rx_queue: VecDeque<MuxFrame>,
     rx_ready_waker: Option<Waker>,
 
-    idle_interval: Interval,
+    last_active: Instant,
 }
 
 impl StreamHandle {
-    fn new(idle_interval: Interval) -> Self {
+    fn new() -> Self {
         Self {
             closed: false,
             tx_queue: VecDeque::with_capacity(128),
             tx_done_waker: None,
             rx_queue: VecDeque::with_capacity(128),
             rx_ready_waker: None,
-            idle_interval,
+            last_active: Instant::now(),
         }
     }
 
@@ -509,7 +528,7 @@ struct MuxState<T: TokioConn> {
     inner: Framed<T, MuxCodec>,
     handles: HashMap<u32, StreamHandle>,
 
-    accept_queue: VecDeque<MuxStream<T>>,
+    accept_queue: VecDeque<u32>,
     accept_waker: Option<Waker>,
 
     tx_queue: VecDeque<MuxFrame>,
@@ -518,6 +537,7 @@ struct MuxState<T: TokioConn> {
 
     closed: bool,
     accept_closed: bool,
+    public_handles: usize,
 
     stream_id_hint: Wrapping<u32>,
     stream_id_type: StreamIdType,
@@ -535,6 +555,17 @@ impl<T: TokioConn> Drop for MuxState<T> {
 }
 
 impl<T: TokioConn> MuxState<T> {
+    #[inline]
+    fn dec_public_handles(&mut self) {
+        if self.public_handles == 0 {
+            return;
+        }
+        self.public_handles -= 1;
+        if self.public_handles == 0 {
+            self.close();
+        }
+    }
+
     fn alloc_stream_id(&mut self) -> MuxResult<u32> {
         if self.handles.len() >= (u32::MAX / 2) as usize {
             return Err(MuxError::TooManyStreams);
@@ -576,9 +607,17 @@ impl<T: TokioConn> MuxState<T> {
             ));
         }
 
-        let handle = StreamHandle::new(self.get_idle_interval());
+        let handle = StreamHandle::new();
         self.handles.insert(stream_id, handle);
         Ok(())
+    }
+
+    fn close_unaccepted_streams(&mut self) {
+        while let Some(stream_id) = self.accept_queue.pop_front() {
+            self.try_mark_finish(stream_id);
+            self.send_finish(stream_id);
+            self.remove_stream(stream_id);
+        }
     }
 
     #[inline]
@@ -594,7 +633,7 @@ impl<T: TokioConn> MuxState<T> {
         if let Some(handle) = self.handles.get_mut(&frame.header.stream_id) {
             handle.rx_queue.push_back(frame);
             handle.notify_rx_ready();
-            handle.idle_interval.reset();
+            handle.last_active = Instant::now();
             true
         } else {
             false
@@ -669,11 +708,6 @@ impl<T: TokioConn> MuxState<T> {
         }
     }
 
-    #[inline]
-    fn get_idle_interval(&self) -> Interval {
-        interval(Duration::from_secs(self.idle_timeout))
-    }
-
     fn poll_stream_write_ready(&mut self, cx: &Context<'_>, stream_id: u32) -> Poll<MuxResult<()>> {
         self.check_closed()?;
         let handle = self.handles.get_mut(&stream_id).unwrap();
@@ -689,10 +723,9 @@ impl<T: TokioConn> MuxState<T> {
     }
 
     fn enqueue_frame_stream(&mut self, stream_id: u32, frame: MuxFrame) {
-        let interval = self.get_idle_interval();
         let handle = self.handles.get_mut(&stream_id).unwrap();
         handle.tx_queue.push_back(frame);
-        handle.idle_interval = interval;
+        handle.last_active = Instant::now();
     }
 
     #[inline]
