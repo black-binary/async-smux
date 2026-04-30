@@ -73,7 +73,7 @@ mod tests {
         time::Duration,
     };
 
-    use rand::RngCore;
+    use rand::Rng;
     use tokio::{
         io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf},
         net::{TcpListener, TcpStream},
@@ -98,8 +98,8 @@ mod tests {
         const LEN: usize = MAX_PAYLOAD_SIZE + 0x200;
         let mut data1 = vec![0; LEN];
         let mut data2 = vec![0; LEN];
-        rand::thread_rng().fill_bytes(&mut data1);
-        rand::thread_rng().fill_bytes(&mut data2);
+        rand::rng().fill_bytes(&mut data1);
+        rand::rng().fill_bytes(&mut data2);
 
         let mut buf = vec![0; LEN];
 

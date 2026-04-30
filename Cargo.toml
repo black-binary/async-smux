@@ -11,19 +11,15 @@ futures = "0.3"
 tokio = { version = "1", features = ["io-util", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 bytes = "1.9"
-rand = "0.8"
 log = "0.4"
 parking_lot = "0.12"
-pin-project = "1.1"
 thiserror = "2.0"
 futures-sink = "0.3"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
-env_logger = "0.11"
-criterion = "0.5"
-pprof = { version = "0.14", features = ["flamegraph"] }
-lazy_static = "1.4"
+rand = "0.10"
+lazy_static = "1.5"
 
 [profile.release]
 debug = true
