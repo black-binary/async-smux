@@ -1,35 +1,57 @@
-//! A lightweight and fast asynchronous [smux](https://github.com/xtaci/smux) (Simple MUltipleXing) library for Tokio async runtime.
+//! Asynchronous [smux](https://github.com/xtaci/smux) (Simple MUltipleXing)
+//! for Tokio. Wraps any `AsyncRead + AsyncWrite + Unpin` transport and
+//! exposes many bi-directional [`MuxStream`]s over it — each one
+//! implements `AsyncRead + AsyncWrite` itself, so you can use them
+//! anywhere a TCP stream would go.
+//!
 //! # Quickstart
 //!
 //! ```ignore
-//! ## Server
-//! // Initialize a stream with `AsyncRead + AsyncWrite`, e.g. TcpStream
-//! let tcp_connection = ...
-//! // Spawn a smux server to multiplexing the tcp stream using `MuxBuilder`
-//! let connector, acceptor, worker = MuxBuilder::server().with_connection(tcp_connection).build();
-//! // Spawn the smux worker (or a worker `future`, more precisely)
-//! // The worker keeps running and dispatch smux frames until you drop (or close) all streams, acceptors and connectors
+//! use async_smux::MuxBuilder;
+//! use tokio::io::{AsyncReadExt, AsyncWriteExt};
+//! use tokio::net::TcpStream;
+//!
+//! let tcp = TcpStream::connect("127.0.0.1:12345").await?;
+//!
+//! // build() returns three pieces:
+//! //   connector — open outgoing streams
+//! //   acceptor  — receive peer-initiated streams
+//! //   worker    — the future that drives I/O; spawn it
+//! let (connector, mut acceptor, worker) =
+//!     MuxBuilder::client().with_connection(tcp).build();
 //! tokio::spawn(worker);
 //!
-//! // Now we are ready to go!
-//! // Both client and server can spawn and accept bi-directional streams
-//! let outgoing_stream = connector.connect().unwrap();
-//! let incoming_stream = acceptor.accept().await.unwrap();
+//! let mut s = connector.connect()?;
+//! s.write_all(b"hello").await?;
 //!
-//! // Just use these smux streams like normal tcp streams :)
-//! incoming_stream.read(...).await.unwrap();
-//! incoming_stream.write_all(...).await.unwrap();
+//! while let Some(mut peer) = acceptor.accept().await {
+//!     // handle peer-initiated stream
+//! }
 //! ```
-//! ## Client
-//! ```ignore
-//! let tcp_connection = ...
-//! // Just like what we do at the server side, except that we are calling the `client()` function this time
-//! let (connector, acceptor, worker) = MuxBuilder::client().with_connection(tcp_connection).build();
-//! tokio::spawn(worker);
 //!
-//! let outgoing_stream1 = connector.connect().unwrap();
-//! ...
-//! ```
+//! Use [`MuxBuilder::server`] instead of `client()` on the listening
+//! side; the only difference is stream-id parity (odd vs. even) so
+//! locally-allocated ids never collide.
+//!
+//! # Lifecycle
+//!
+//! The worker future exits when all public handles
+//! ([`MuxConnector`] + [`MuxAcceptor`] + [`MuxStream`]s) are dropped,
+//! when [`MuxConnector::close`] is awaited, when the peer closes the
+//! transport, or when a configured keep-alive timeout fires.
+//!
+//! `close()` performs an orderly shutdown — frames already accepted
+//! via `AsyncWrite::poll_write` are drained to the wire before the
+//! transport is closed. It does not require the worker to be polled,
+//! and it is cancellation-safe: dropping the future mid-flight hands
+//! control back to the worker without wedging it.
+//!
+//! # Configuration
+//!
+//! See [`MuxBuilder`] for the available knobs: `with_keep_alive_interval`,
+//! `with_keep_alive_timeout`, `with_idle_timeout`, `with_max_tx_queue`,
+//! `with_max_rx_queue`. Keep-alive and idle timeout are off unless
+//! explicitly enabled.
 
 pub mod builder;
 pub mod config;

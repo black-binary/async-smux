@@ -26,10 +26,16 @@ use crate::{
     frame::{MuxCodec, MuxCommand, MuxFrame, MAX_PAYLOAD_SIZE},
 };
 
+/// Marker for any transport usable as a smux carrier. Auto-implemented
+/// for every `AsyncRead + AsyncWrite + Unpin`.
 pub trait TokioConn: AsyncRead + AsyncWrite + Unpin {}
 
 impl<T> TokioConn for T where T: AsyncRead + AsyncWrite + Unpin {}
 
+/// Construct a smux session from a transport and a [`MuxConfig`].
+///
+/// Prefer [`crate::MuxBuilder`] for new code; this is the lower-level
+/// entry point used by the builder.
 pub fn mux_connection<T: TokioConn>(
     connection: T,
     config: MuxConfig,
@@ -71,6 +77,10 @@ pub fn mux_connection<T: TokioConn>(
     )
 }
 
+/// Opens new outgoing streams over a smux session. Cloneable; multiple
+/// connectors may share the same session. When all public handles
+/// (connectors, acceptors, streams) are dropped, the session shuts
+/// down.
 pub struct MuxConnector<T: TokioConn> {
     state: Arc<Mutex<MuxState<T>>>,
 }
@@ -95,6 +105,12 @@ impl<T: TokioConn> Drop for CloseGuard<'_, T> {
 }
 
 impl<T: TokioConn> MuxConnector<T> {
+    /// Open a new outgoing stream. Allocates a fresh local stream id,
+    /// queues a SYN frame, and returns a [`MuxStream`] ready for I/O.
+    ///
+    /// Returns [`MuxError::ConnectionClosed`] if the session has been
+    /// closed and [`MuxError::TooManyStreams`] if no fresh id is
+    /// available.
     pub fn connect(&self) -> MuxResult<MuxStream<T>> {
         let mut state = self.state.lock();
         state.check_closed()?;
@@ -114,6 +130,16 @@ impl<T: TokioConn> MuxConnector<T> {
         Ok(stream)
     }
 
+    /// Orderly shutdown. Drains every frame already enqueued (per-stream
+    /// PSH, FIN, control frames, and any bytes still buffered inside
+    /// the framed sink) to the wire, then closes the underlying
+    /// transport. After it returns, the session is fully closed and
+    /// every other handle observes `ConnectionClosed`.
+    ///
+    /// Works whether or not the worker is being polled — `close()`
+    /// drives the shutdown sequence itself. It is also cancellation-
+    /// safe: dropping the future mid-flight hands control back to the
+    /// worker without leaving the session wedged.
     pub async fn close(&mut self) -> MuxResult<()> {
         {
             let mut state = self.state.lock();
@@ -175,6 +201,8 @@ impl<T: TokioConn> MuxConnector<T> {
         .await
     }
 
+    /// Number of streams currently open on this session (in either
+    /// direction).
     pub fn get_num_streams(&self) -> usize {
         self.state.lock().handles.len()
     }
@@ -200,6 +228,9 @@ impl<T: TokioConn> Drop for MuxConnector<T> {
     }
 }
 
+/// Receives peer-initiated streams. Implements `Stream<Item =
+/// MuxStream<T>>`; `accept().await` is sugar for `next().await`.
+/// Dropping the acceptor refuses any further peer SYNs.
 pub struct MuxAcceptor<T: TokioConn> {
     state: Arc<Mutex<MuxState<T>>>,
 }
@@ -214,6 +245,8 @@ impl<T: TokioConn> Drop for MuxAcceptor<T> {
 }
 
 impl<T: TokioConn> MuxAcceptor<T> {
+    /// Wait for the next peer-initiated stream. Returns `None` when
+    /// the session is closed.
     pub async fn accept(&mut self) -> Option<MuxStream<T>> {
         self.next().await
     }
@@ -422,6 +455,10 @@ impl<T: TokioConn> Future for MuxDispatcher<T> {
     }
 }
 
+/// Driver future for the session: reads frames from the transport,
+/// writes outgoing frames, fires keep-alive / idle timers. Spawn it
+/// (`tokio::spawn(worker)`) and otherwise leave it alone — it
+/// resolves when the session shuts down.
 pub struct MuxWorker<T: TokioConn> {
     dispatcher: MuxDispatcher<T>,
     sender: MuxSender<T>,
@@ -451,6 +488,11 @@ impl<T: TokioConn> Future for MuxWorker<T> {
     }
 }
 
+/// A bi-directional stream multiplexed over the session. Implements
+/// `AsyncRead + AsyncWrite + Unpin`, so it can be used anywhere a
+/// `TcpStream` would. Dropping it without `shutdown()` is fine — the
+/// stream's pending tx queue is moved to the global queue and a FIN
+/// is enqueued so the peer sees a clean close.
 pub struct MuxStream<T: TokioConn> {
     stream_id: u32,
     state: Arc<Mutex<MuxState<T>>>,
@@ -593,10 +635,13 @@ impl<T: TokioConn> AsyncWrite for MuxStream<T> {
 }
 
 impl<T: TokioConn> MuxStream<T> {
+    /// True once the stream has received FIN, the session has hard-
+    /// closed, or an idle timeout reaped the handle.
     pub fn is_closed(&mut self) -> bool {
         self.state.lock().is_closed(self.stream_id)
     }
 
+    /// The 32-bit smux stream id assigned to this stream.
     pub fn get_stream_id(&self) -> u32 {
         self.stream_id
     }
