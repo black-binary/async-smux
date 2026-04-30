@@ -856,4 +856,33 @@ mod tests {
             "in-flight data was lost during close without worker"
         );
     }
+
+    // BUG: MuxConnector::close sets closing_inline=true to make the worker's
+    // sender step out of the way. If the close() future is dropped before
+    // it finishes (e.g. select! racing it against a timeout), the flag
+    // would stick at true and the sender would be parked forever — silently
+    // wedging the worker.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_close_cancellation_resets_closing_inline() {
+        // Hold the peer half so the duplex never drains. close() will park
+        // in poll_close_unpin and never finish under the timeout.
+        let (a, _b_held) = tokio::io::duplex(32);
+        let (mut connector_a, _acc, _worker_a) =
+            MuxBuilder::client().with_connection(a).build();
+
+        let mut s = connector_a.connect().unwrap();
+        s.write_all(&vec![0u8; 1024]).await.unwrap();
+        drop(s);
+
+        // The peer never reads, so close() cannot complete. tight timeout
+        // wins and drops the close() future.
+        tokio::time::timeout(Duration::from_millis(100), connector_a.close())
+            .await
+            .expect_err("close should hang while peer is jammed");
+
+        assert!(
+            !connector_a.is_closing_inline(),
+            "closing_inline must be reset after close() future is cancelled"
+        );
+    }
 }

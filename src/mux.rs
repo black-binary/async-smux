@@ -107,6 +107,25 @@ pub struct MuxConnector<T: TokioConn> {
     state: Arc<Mutex<MuxState<T>>>,
 }
 
+/// Resets `closing_inline` if `MuxConnector::close` is dropped before
+/// it finishes. On normal completion, hard_close has already set
+/// `state.closed=true` and the sender exits via `check_closed`, so the
+/// reset is a no-op. On cancellation, this hands control of Framed back
+/// to the sender so the worker can still make progress.
+struct CloseGuard<'a, T: TokioConn> {
+    state: &'a Arc<Mutex<MuxState<T>>>,
+}
+
+impl<T: TokioConn> Drop for CloseGuard<'_, T> {
+    fn drop(&mut self) {
+        let mut state = self.state.lock();
+        if !state.closed {
+            state.closing_inline = false;
+            state.notify_should_tx();
+        }
+    }
+}
+
 impl<T: TokioConn> MuxConnector<T> {
     pub fn connect(&self) -> MuxResult<MuxStream<T>> {
         let mut state = self.state.lock();
@@ -137,11 +156,15 @@ impl<T: TokioConn> MuxConnector<T> {
             // already serializes physical access; this flag avoids
             // logical wakeup loss between the two actors.
             state.closing_inline = true;
-            // Wake the sender now so it observes the flag promptly
-            // (otherwise it could still be parked on Framed's waker
-            // slot, which we are about to take over).
-            state.notify_should_tx();
         }
+        // RAII guard: if this future is dropped (e.g. select! with a
+        // timeout) before close() finishes, reset closing_inline so the
+        // sender takes over again. Without this the sender would stay
+        // permanently parked on closing_inline=true and the worker would
+        // hang.
+        let _guard = CloseGuard {
+            state: &self.state,
+        };
         poll_fn(|cx| {
             let mut state = self.state.lock();
             // Save waker so an externally-driven hard_close (dispatcher
@@ -186,6 +209,11 @@ impl<T: TokioConn> MuxConnector<T> {
 
     pub fn get_num_streams(&self) -> usize {
         self.state.lock().handles.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_closing_inline(&self) -> bool {
+        self.state.lock().closing_inline
     }
 }
 
