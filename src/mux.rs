@@ -176,7 +176,7 @@ impl<T: TokioConn> MuxConnector<T> {
                 }
                 Poll::Ready(Err(e)) => {
                     state.hard_close();
-                    Poll::Ready(Err(MuxError::from(e)))
+                    Poll::Ready(Err(e))
                 }
                 Poll::Pending => Poll::Pending,
             }
