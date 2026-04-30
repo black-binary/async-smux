@@ -35,42 +35,10 @@ pub fn mux_connection<T: TokioConn>(
     config: MuxConfig,
 ) -> (MuxConnector<T>, MuxAcceptor<T>, MuxWorker<T>) {
     let inner = Framed::new(connection, MuxCodec {});
-    // When keep_alive is enabled, default the dead-peer timeout to
-    // 3 * keep_alive_interval, matching the convention used by other
-    // smux implementations.
-    let keep_alive_timeout = config.keep_alive_interval.map(|i| {
-        let secs = config
-            .keep_alive_timeout
-            .map(|t| t.get())
-            .unwrap_or_else(|| i.get().saturating_mul(3));
-        Duration::from_secs(secs)
-    });
-    let state = Arc::new(Mutex::new(MuxState {
-        inner,
-        handles: HashMap::new(),
-        accept_queue: VecDeque::new(),
-        accept_waker: None,
-        tx_queue: VecDeque::with_capacity(config.max_tx_queue.get()),
-        should_tx_waker: None,
-        rx_consumed_waker: None,
-        close_waker: None,
-        closed: false,
-        shutdown_requested: false,
-        closing_inline: false,
-        accept_closed: false,
-        public_handles: 0,
-        stream_id_hint: Wrapping(config.stream_id_type as u32),
-        stream_id_type: config.stream_id_type,
-        idle_timeout: config.idle_timeout.map(|n| Duration::from_secs(n.get())),
-        keep_alive_timeout,
-        last_rx: Instant::now(),
-        max_tx_queue: config.max_tx_queue.get(),
-        max_rx_queue: config.max_rx_queue.get(),
-    }));
-    {
-        // Expose 2 public handles: connector + acceptor.
-        state.lock().public_handles = 2;
-    }
+    let mut state = MuxState::new(inner, config);
+    // Expose 2 public handles: connector + acceptor.
+    state.public_handles = 2;
+    let state = Arc::new(Mutex::new(state));
     (
         MuxConnector {
             state: state.clone(),
@@ -742,6 +710,41 @@ impl<T: TokioConn> Drop for MuxState<T> {
 }
 
 impl<T: TokioConn> MuxState<T> {
+    fn new(inner: Framed<T, MuxCodec>, config: MuxConfig) -> Self {
+        // When keep_alive is enabled, default the dead-peer timeout to
+        // 3 * keep_alive_interval, matching the convention used by other
+        // smux implementations.
+        let keep_alive_timeout = config.keep_alive_interval.map(|i| {
+            let secs = config
+                .keep_alive_timeout
+                .map(|t| t.get())
+                .unwrap_or_else(|| i.get().saturating_mul(3));
+            Duration::from_secs(secs)
+        });
+        Self {
+            inner,
+            handles: HashMap::new(),
+            accept_queue: VecDeque::new(),
+            accept_waker: None,
+            tx_queue: VecDeque::with_capacity(config.max_tx_queue.get()),
+            should_tx_waker: None,
+            rx_consumed_waker: None,
+            close_waker: None,
+            closed: false,
+            shutdown_requested: false,
+            closing_inline: false,
+            accept_closed: false,
+            public_handles: 0,
+            stream_id_hint: Wrapping(config.stream_id_type as u32),
+            stream_id_type: config.stream_id_type,
+            idle_timeout: config.idle_timeout.map(|n| Duration::from_secs(n.get())),
+            keep_alive_timeout,
+            last_rx: Instant::now(),
+            max_tx_queue: config.max_tx_queue.get(),
+            max_rx_queue: config.max_rx_queue.get(),
+        }
+    }
+
     #[inline]
     fn dec_public_handles(&mut self) {
         if self.public_handles == 0 {
@@ -1150,35 +1153,21 @@ impl<T: TokioConn> MuxState<T> {
 mod alloc_tests {
     use super::*;
     use crate::config::StreamIdType;
-    use std::num::Wrapping;
+    use std::num::{NonZeroUsize, Wrapping};
 
     fn fresh_state(stream_id_type: StreamIdType) -> MuxState<tokio::io::DuplexStream> {
-        // Construct a state without going through mux_connection so we can
-        // poke at alloc_stream_id directly. The TokioConn we feed in is
-        // unused by alloc_stream_id.
+        // Construct a state via the same constructor that mux_connection
+        // uses so new MuxState fields don't need duplicating here.
         let (a, _b) = tokio::io::duplex(64);
-        MuxState {
-            inner: Framed::new(a, MuxCodec {}),
-            handles: HashMap::new(),
-            accept_queue: VecDeque::new(),
-            accept_waker: None,
-            tx_queue: VecDeque::new(),
-            should_tx_waker: None,
-            rx_consumed_waker: None,
-            closed: false,
-            accept_closed: false,
-            public_handles: 0,
-            stream_id_hint: Wrapping(stream_id_type as u32),
+        let cfg = MuxConfig {
             stream_id_type,
-            idle_timeout: None,
+            keep_alive_interval: None,
             keep_alive_timeout: None,
-            last_rx: Instant::now(),
-            max_tx_queue: 1024,
-            max_rx_queue: 1024,
-            shutdown_requested: false,
-            close_waker: None,
-            closing_inline: false,
-        }
+            idle_timeout: None,
+            max_tx_queue: NonZeroUsize::new(1024).unwrap(),
+            max_rx_queue: NonZeroUsize::new(1024).unwrap(),
+        };
+        MuxState::new(Framed::new(a, MuxCodec {}), cfg)
     }
 
     // BUG: with stream_id_hint = Wrapping(0) (Even side), repeated alloc
