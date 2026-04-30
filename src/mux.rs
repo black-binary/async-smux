@@ -388,7 +388,10 @@ impl<T: TokioConn> Future for MuxSender<T> {
                 }
                 return Poll::Pending;
             }
-            ready!(state.poll_should_tx(cx));
+            if !state.has_pending_tx() {
+                // should_tx_waker was registered at the top of this iteration.
+                return Poll::Pending;
+            }
         }
     }
 }
@@ -494,11 +497,11 @@ impl<T: TokioConn> Drop for MuxStream<T> {
             // the per-stream tx_queue would otherwise be dropped together
             // with the StreamHandle below, so move it onto the global
             // tx_queue first, then enqueue FIN after, so the wire sees
-            // PSH... PSH FIN in order.
-            if let Some(h) = state.handles.get_mut(&self.stream_id) {
-                let drained: VecDeque<MuxFrame> = std::mem::take(&mut h.tx_queue);
-                state.tx_queue.extend(drained);
-            }
+            // PSH... PSH FIN in order. Handle is guaranteed to exist here
+            // — is_closed just asserted it.
+            let h = state.handles.get_mut(&self.stream_id).unwrap();
+            let drained: VecDeque<MuxFrame> = std::mem::take(&mut h.tx_queue);
+            state.tx_queue.extend(drained);
             state.enqueue_frame_global(MuxFrame::new(
                 MuxCommand::Finish,
                 self.stream_id,
@@ -971,11 +974,6 @@ impl<T: TokioConn> MuxState<T> {
     }
 
     #[inline]
-    fn register_should_tx_waker(&mut self, cx: &Context<'_>) {
-        self.should_tx_waker = Some(cx.waker().clone());
-    }
-
-    #[inline]
     fn register_rx_consumed_waker(&mut self, cx: &Context<'_>) {
         self.rx_consumed_waker = Some(cx.waker().clone());
     }
@@ -1143,13 +1141,8 @@ impl<T: TokioConn> MuxState<T> {
         self.inner.poll_flush_unpin(cx)
     }
 
-    fn poll_should_tx(&mut self, cx: &mut Context<'_>) -> Poll<()> {
-        if self.tx_queue.is_empty() && self.handles.iter().all(|(_, h)| h.tx_queue.is_empty()) {
-            self.register_should_tx_waker(cx);
-            Poll::Pending
-        } else {
-            Poll::Ready(())
-        }
+    fn has_pending_tx(&self) -> bool {
+        !self.tx_queue.is_empty() || self.handles.values().any(|h| !h.tx_queue.is_empty())
     }
 }
 
