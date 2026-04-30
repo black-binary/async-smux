@@ -35,6 +35,16 @@ pub fn mux_connection<T: TokioConn>(
     config: MuxConfig,
 ) -> (MuxConnector<T>, MuxAcceptor<T>, MuxWorker<T>) {
     let inner = Framed::new(connection, MuxCodec {});
+    // When keep_alive is enabled, default the dead-peer timeout to
+    // 3 * keep_alive_interval, matching the convention used by other
+    // smux implementations.
+    let keep_alive_timeout = config.keep_alive_interval.map(|i| {
+        let secs = config
+            .keep_alive_timeout
+            .map(|t| t.get())
+            .unwrap_or_else(|| i.get().saturating_mul(3));
+        Duration::from_secs(secs)
+    });
     let state = Arc::new(Mutex::new(MuxState {
         inner,
         handles: HashMap::new(),
@@ -43,12 +53,17 @@ pub fn mux_connection<T: TokioConn>(
         tx_queue: VecDeque::with_capacity(config.max_tx_queue.get()),
         should_tx_waker: None,
         rx_consumed_waker: None,
+        close_waker: None,
         closed: false,
+        shutdown_requested: false,
+        closing_inline: false,
         accept_closed: false,
         public_handles: 0,
         stream_id_hint: Wrapping(config.stream_id_type as u32),
         stream_id_type: config.stream_id_type,
-        idle_timeout: config.idle_timeout.map_or(1, |num| num.get()),
+        idle_timeout: config.idle_timeout.map(|n| Duration::from_secs(n.get())),
+        keep_alive_timeout,
+        last_rx: Instant::now(),
         max_tx_queue: config.max_tx_queue.get(),
         max_rx_queue: config.max_rx_queue.get(),
     }));
@@ -72,9 +87,17 @@ pub fn mux_connection<T: TokioConn>(
             },
             timer: MuxTimer {
                 state,
-                interval: interval(Duration::from_millis(500)),
-                keep_alive_interval: config.keep_alive_interval.map(|a| interval(Duration::from_secs(a.get()))),
-                idle_timeout_enabled: config.idle_timeout.is_some(),
+                // Only spin the periodic interval if something needs it.
+                // Otherwise the timer future stays pending forever and
+                // burns no CPU/wakeups.
+                interval: if config.idle_timeout.is_some() || config.keep_alive_interval.is_some() {
+                    Some(interval(Duration::from_millis(500)))
+                } else {
+                    None
+                },
+                keep_alive_interval: config
+                    .keep_alive_interval
+                    .map(|a| interval(Duration::from_secs(a.get()))),
             },
         },
     )
@@ -105,13 +128,60 @@ impl<T: TokioConn> MuxConnector<T> {
     }
 
     pub async fn close(&mut self) -> MuxResult<()> {
-        poll_fn(|cx| {
+        {
             let mut state = self.state.lock();
             state.close();
-            state.inner.poll_close_unpin(cx)
+            // Take ownership of Framed for the rest of close(). The
+            // sender will see this flag at the top of its loop and bow
+            // out, leaving Framed's single waker slot to us. The mutex
+            // already serializes physical access; this flag avoids
+            // logical wakeup loss between the two actors.
+            state.closing_inline = true;
+            // Wake the sender now so it observes the flag promptly
+            // (otherwise it could still be parked on Framed's waker
+            // slot, which we are about to take over).
+            state.notify_should_tx();
+        }
+        poll_fn(|cx| {
+            let mut state = self.state.lock();
+            // Save waker so an externally-driven hard_close (dispatcher
+            // error, transport failure) can wake us if it happens to
+            // race ahead of our own progress here.
+            state.close_waker = Some(cx.waker().clone());
+            if state.closed {
+                return Poll::Ready(Ok(()));
+            }
+            // Drain → flush → close, ourselves. This makes close() not
+            // depend on the worker still being polled.
+            match state.poll_flush_frames(cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(e)) => {
+                    state.hard_close();
+                    return Poll::Ready(Err(e));
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+            match state.poll_flush_inner(cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(e)) => {
+                    state.hard_close();
+                    return Poll::Ready(Err(e));
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+            match state.inner.poll_close_unpin(cx) {
+                Poll::Ready(Ok(())) => {
+                    state.hard_close();
+                    Poll::Ready(Ok(()))
+                }
+                Poll::Ready(Err(e)) => {
+                    state.hard_close();
+                    Poll::Ready(Err(MuxError::from(e)))
+                }
+                Poll::Pending => Poll::Pending,
+            }
         })
-        .await?;
-        Ok(())
+        .await
     }
 
     pub fn get_num_streams(&self) -> usize {
@@ -179,24 +249,32 @@ impl<T: TokioConn> Stream for MuxAcceptor<T> {
 
 struct MuxTimer<T: TokioConn> {
     state: Arc<Mutex<MuxState<T>>>,
-    interval: Interval,
+    interval: Option<Interval>,
 
     keep_alive_interval: Option<Interval>,
-
-    idle_timeout_enabled: bool,
 }
 
 impl<T: TokioConn> Future for MuxTimer<T> {
     type Output = MuxResult<()>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // All fields are Unpin (Arc<Mutex>, Option<Interval>), so we can
+        // freely take a &mut Self and use field-splitting to mutably
+        // borrow `interval` and `keep_alive_interval` independently.
+        let this = self.as_mut().get_mut();
+        let Some(interval) = this.interval.as_mut() else {
+            // No idle / keep-alive features enabled, so the timer never
+            // needs to fire. Stay pending forever - the worker is driven
+            // by dispatcher and sender alone.
+            return Poll::Pending;
+        };
         loop {
-            ready!(self.interval.poll_tick(cx));
-            self.interval.reset();
+            ready!(interval.poll_tick(cx));
+            interval.reset();
 
             // Ping check
             let mut is_ping_send_needs = false;
-            if let Some(keep_alive_interval) = self.keep_alive_interval.as_mut() {
+            if let Some(keep_alive_interval) = this.keep_alive_interval.as_mut() {
                 if keep_alive_interval.poll_tick(cx).is_ready() {
                     keep_alive_interval.reset();
 
@@ -204,7 +282,7 @@ impl<T: TokioConn> Future for MuxTimer<T> {
                 }
             }
 
-            let mut state = self.state.lock();
+            let mut state = this.state.lock();
 
             // Ping send
             if is_ping_send_needs {
@@ -212,10 +290,20 @@ impl<T: TokioConn> Future for MuxTimer<T> {
                 state.notify_should_tx();
             }
 
+            // Dead-peer detection. If keep-alive is enabled and we have not
+            // received any frame from the peer for keep_alive_timeout, treat
+            // the connection as dead and tear everything down so callers
+            // unblock instead of hanging on a half-open socket.
+            if let Some(timeout) = state.keep_alive_timeout {
+                if Instant::now().duration_since(state.last_rx) >= timeout {
+                    state.hard_close();
+                    return Poll::Ready(Err(MuxError::ConnectionClosed));
+                }
+            }
+
             // Clean timeout streams
-            if self.idle_timeout_enabled {
+            if let Some(timeout) = state.idle_timeout {
                 let now = Instant::now();
-                let timeout = Duration::from_secs(state.idle_timeout);
                 let dead_ids = state
                     .handles
                     .iter()
@@ -248,9 +336,30 @@ impl<T: TokioConn> Future for MuxSender<T> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         loop {
             let mut state = self.state.lock();
+            // Always register should_tx_waker first so any state-change
+            // notification (close start, hard_close, new tx work) can
+            // reach us even if we'd otherwise be parked on Framed's
+            // single waker slot deeper in this loop.
+            state.should_tx_waker = Some(cx.waker().clone());
             state.check_closed()?;
-            ready!(state.poll_flush_frames(cx)).inspect_err(|_| state.close())?;
-            ready!(state.poll_flush_inner(cx)).inspect_err(|_| state.close())?;
+            // MuxConnector::close drives Framed inline; stay out of the
+            // way. We'll be re-woken by hard_close via should_tx_waker.
+            if state.closing_inline {
+                return Poll::Pending;
+            }
+            ready!(state.poll_flush_frames(cx)).inspect_err(|_| state.hard_close())?;
+            ready!(state.poll_flush_inner(cx)).inspect_err(|_| state.hard_close())?;
+            // After draining, finalize an orderly shutdown if one was
+            // requested. Closing the inner sink lets the dispatcher's
+            // poll_next observe EOF and exit cleanly.
+            if state.shutdown_requested && !state.closed {
+                let res = state.inner.poll_close_unpin(cx);
+                if let Poll::Ready(r) = res {
+                    state.hard_close();
+                    return Poll::Ready(r);
+                }
+                return Poll::Pending;
+            }
             ready!(state.poll_should_tx(cx));
         }
     }
@@ -258,7 +367,7 @@ impl<T: TokioConn> Future for MuxSender<T> {
 
 impl<T: TokioConn> Drop for MuxSender<T> {
     fn drop(&mut self) {
-        self.state.lock().close();
+        self.state.lock().hard_close();
     }
 }
 
@@ -268,7 +377,7 @@ struct MuxDispatcher<T: TokioConn> {
 
 impl<T: TokioConn> Drop for MuxDispatcher<T> {
     fn drop(&mut self) {
-        self.state.lock().close();
+        self.state.lock().hard_close();
     }
 }
 
@@ -282,7 +391,10 @@ impl<T: TokioConn> Future for MuxDispatcher<T> {
 
             ready!(state.poll_ready_rx_consumed(cx)); // Can stuck here forever, be careful
 
-            let frame = ready!(state.poll_next_frame(cx)).inspect_err(|_| state.close())?;
+            let frame = ready!(state.poll_next_frame(cx)).inspect_err(|_| state.hard_close())?;
+            // Refresh peer-liveness clock on every successfully-decoded
+            // frame - any frame, including NOPs, proves the peer is alive.
+            state.last_rx = Instant::now();
             match frame.header.command {
                 MuxCommand::Sync => {
                     if state.accept_closed {
@@ -321,7 +433,12 @@ impl<T: TokioConn> Future for MuxWorker<T> {
     type Output = MuxResult<()>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let _ = self.timer.poll_unpin(cx);
+        // Timer used to be a never-resolving infinite future; with dead-peer
+        // detection it can now resolve to Err(ConnectionClosed). Surface
+        // that result so the worker terminates instead of spinning.
+        if let Poll::Ready(res) = self.timer.poll_unpin(cx) {
+            return Poll::Ready(res);
+        }
 
         if self.dispatcher.poll_unpin(cx)?.is_ready() {
             return Poll::Ready(Ok(()));
@@ -345,7 +462,15 @@ impl<T: TokioConn> Drop for MuxStream<T> {
     fn drop(&mut self) {
         let mut state = self.state.lock();
         if !state.is_closed(self.stream_id) {
-            // The user did not call `shutdown()`
+            // The user did not call `shutdown()`. Anything still queued in
+            // the per-stream tx_queue would otherwise be dropped together
+            // with the StreamHandle below, so move it onto the global
+            // tx_queue first, then enqueue FIN after, so the wire sees
+            // PSH... PSH FIN in order.
+            if let Some(h) = state.handles.get_mut(&self.stream_id) {
+                let drained: VecDeque<MuxFrame> = std::mem::take(&mut h.tx_queue);
+                state.tx_queue.extend(drained);
+            }
             state.enqueue_frame_global(MuxFrame::new(
                 MuxCommand::Finish,
                 self.stream_id,
@@ -417,29 +542,38 @@ impl<T: TokioConn> AsyncWrite for MuxStream<T> {
 
         ready!(state.poll_stream_write_ready(cx, self.stream_id)).map_err(mux_to_io_err)?;
 
-        let mut write_buffer = Bytes::copy_from_slice(buf);
-        while !write_buffer.is_empty() {
-            let len = write_buffer.len().min(MAX_PAYLOAD_SIZE);
-            let payload = write_buffer.split_to(len);
-            let frame = MuxFrame::new(MuxCommand::Push, self.stream_id, payload);
-            state.enqueue_frame_stream(self.stream_id, frame);
-        }
+        // Enqueue at most one frame per poll_write so the per-stream
+        // back-pressure check above is consulted between frames. Otherwise
+        // a single large write_all call would push the tx_queue arbitrarily
+        // far past max_tx_queue. AsyncWriteExt::write_all loops until all
+        // bytes are accepted, so caller semantics are preserved.
+        let len = buf.len().min(MAX_PAYLOAD_SIZE);
+        let payload = Bytes::copy_from_slice(&buf[..len]);
+        let frame = MuxFrame::new(MuxCommand::Push, self.stream_id, payload);
+        state.enqueue_frame_stream(self.stream_id, frame);
         state.notify_should_tx();
-        Poll::Ready(Ok(buf.len()))
+        Poll::Ready(Ok(len))
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), StdIo::Error>> {
         let mut state = self.state.lock();
+        // Always try to drain the stream's tx_queue first, even if the
+        // stream has been remotely closed. Bytes that the user already
+        // accepted via poll_write should reach the wire on a best-effort
+        // basis; only after the queue is empty do we surface the close as
+        // an error.
+        match state.poll_flush_stream_frames(cx, self.stream_id) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(mux_to_io_err(e))),
+            Poll::Pending => return Poll::Pending,
+        }
         if state.is_closed(self.stream_id) {
             return Poll::Ready(Err(new_io_err(
                 StdIo::ErrorKind::ConnectionReset,
                 "stream tx is already closed",
             )));
         }
-
-        state
-            .poll_flush_stream_frames(cx, self.stream_id)
-            .map_err(mux_to_io_err)
+        Poll::Ready(Ok(()))
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), StdIo::Error>> {
@@ -534,15 +668,37 @@ struct MuxState<T: TokioConn> {
     tx_queue: VecDeque<MuxFrame>,
     should_tx_waker: Option<Waker>,
     rx_consumed_waker: Option<Waker>,
+    /// Wakes whoever is awaiting on hard_close completion (currently
+    /// MuxConnector::close).
+    close_waker: Option<Waker>,
 
     closed: bool,
+    /// Soft-close requested: drain everything that's already queued, then
+    /// hard-close. Distinct from `closed` (which is the immediate, no-drain
+    /// teardown) so that user-initiated shutdown does not lose pending FIN
+    /// / PSH frames already enqueued by Drop impls.
+    shutdown_requested: bool,
+    /// Set while `MuxConnector::close` is driving Framed itself. The
+    /// sender steps out of the way on this flag so that close() can
+    /// finish even when the worker isn't being polled (e.g. the user
+    /// forgot to spawn it, or it has already exited). The mutex
+    /// serializes access to Framed; the flag prevents close()/sender
+    /// from clobbering each other's wakers on Framed's single waker
+    /// slot.
+    closing_inline: bool,
     accept_closed: bool,
     public_handles: usize,
 
     stream_id_hint: Wrapping<u32>,
     stream_id_type: StreamIdType,
 
-    idle_timeout: u64,
+    idle_timeout: Option<Duration>,
+
+    /// Maximum gap between received frames before declaring the peer dead.
+    /// Only Some when keep_alive_interval is also set.
+    keep_alive_timeout: Option<Duration>,
+    /// Last time the dispatcher successfully decoded a frame from the peer.
+    last_rx: Instant,
 
     max_tx_queue: usize,
     max_rx_queue: usize,
@@ -574,6 +730,13 @@ impl<T: TokioConn> MuxState<T> {
         loop {
             self.stream_id_hint += 2;
 
+            // 0 is reserved for NOP keep-alive frames - never hand it out as
+            // a real stream id. After u32 wraparound the even side would
+            // otherwise step onto 0.
+            if self.stream_id_hint.0 == 0 {
+                continue;
+            }
+
             if !self.handles.contains_key(&self.stream_id_hint.0) {
                 break;
             }
@@ -584,7 +747,10 @@ impl<T: TokioConn> MuxState<T> {
 
     #[inline]
     fn remove_stream(&mut self, stream_id: u32) {
-        self.handles.remove(&stream_id).unwrap();
+        // Idempotent: a stream may be removed via close_unaccepted_streams
+        // and again via MuxStream::Drop in pathological orderings, so
+        // tolerate a missing entry instead of panicking.
+        self.handles.remove(&stream_id);
         // Rx queue may change
         self.notify_rx_consumed();
     }
@@ -595,6 +761,13 @@ impl<T: TokioConn> MuxState<T> {
     }
 
     fn process_sync(&mut self, stream_id: u32, dir: Direction) -> MuxResult<()> {
+        // Stream id 0 is reserved (NOP keep-alive). Reject SYN(0) from either
+        // side so peer-misbehavior cannot create a regular stream colliding
+        // with NOP semantics.
+        if stream_id == 0 {
+            return Err(MuxError::ReservedStreamId(stream_id));
+        }
+
         if self.handles.contains_key(&stream_id) {
             return Err(MuxError::DuplicatedStreamId(stream_id));
         }
@@ -631,6 +804,14 @@ impl<T: TokioConn> MuxState<T> {
 
     fn recv_push(&mut self, frame: MuxFrame) -> bool {
         if let Some(handle) = self.handles.get_mut(&frame.header.stream_id) {
+            // If we've already locally closed the stream (shutdown / FIN
+            // received), drop incoming PSH instead of silently appending it
+            // to rx_queue. Otherwise EOF would not be monotonic: a reader
+            // who already saw 0 bytes could then surface bytes that arrived
+            // afterwards.
+            if handle.closed {
+                return false;
+            }
             handle.rx_queue.push_back(frame);
             handle.notify_rx_ready();
             handle.last_active = Instant::now();
@@ -660,7 +841,15 @@ impl<T: TokioConn> MuxState<T> {
     }
 
     fn is_closed(&self, stream_id: u32) -> bool {
-        self.handles.get(&stream_id).unwrap().closed
+        // Invariant: when a MuxStream holds `stream_id`, its handle must
+        // be present. Catch invariant breaks in debug builds; in release
+        // builds, treat a missing handle as closed so we don't panic in
+        // the user's hot path.
+        debug_assert!(
+            self.handles.contains_key(&stream_id),
+            "is_closed called with unknown stream id {stream_id}"
+        );
+        self.handles.get(&stream_id).is_none_or(|h| h.closed)
     }
 
     fn poll_next_frame(&mut self, cx: &mut Context<'_>) -> Poll<MuxResult<MuxFrame>> {
@@ -692,7 +881,14 @@ impl<T: TokioConn> MuxState<T> {
         cx: &mut Context<'_>,
         stream_id: u32,
     ) -> Poll<MuxResult<Option<MuxFrame>>> {
-        let handle = self.handles.get_mut(&stream_id).unwrap();
+        debug_assert!(
+            self.handles.contains_key(&stream_id),
+            "poll_read_stream_data called with unknown stream id {stream_id}"
+        );
+        let Some(handle) = self.handles.get_mut(&stream_id) else {
+            // Handle missing -> stream is gone. Surface as EOF.
+            return Poll::Ready(Ok(None));
+        };
         if let Some(f) = handle.rx_queue.pop_front() {
             self.notify_rx_consumed(); // Rx queue packet consumed
             Poll::Ready(Ok(Some(f)))
@@ -710,7 +906,13 @@ impl<T: TokioConn> MuxState<T> {
 
     fn poll_stream_write_ready(&mut self, cx: &Context<'_>, stream_id: u32) -> Poll<MuxResult<()>> {
         self.check_closed()?;
-        let handle = self.handles.get_mut(&stream_id).unwrap();
+        debug_assert!(
+            self.handles.contains_key(&stream_id),
+            "poll_stream_write_ready called with unknown stream id {stream_id}"
+        );
+        let Some(handle) = self.handles.get_mut(&stream_id) else {
+            return Poll::Ready(Err(MuxError::StreamClosed(stream_id)));
+        };
         if handle.tx_queue.len() > self.max_tx_queue {
             // A stream's tx queue is full
             handle.register_tx_done_waker(cx);
@@ -723,9 +925,16 @@ impl<T: TokioConn> MuxState<T> {
     }
 
     fn enqueue_frame_stream(&mut self, stream_id: u32, frame: MuxFrame) {
-        let handle = self.handles.get_mut(&stream_id).unwrap();
-        handle.tx_queue.push_back(frame);
-        handle.last_active = Instant::now();
+        debug_assert!(
+            self.handles.contains_key(&stream_id),
+            "enqueue_frame_stream called with unknown stream id {stream_id}"
+        );
+        if let Some(handle) = self.handles.get_mut(&stream_id) {
+            handle.tx_queue.push_back(frame);
+            handle.last_active = Instant::now();
+        }
+        // No-op if the handle is gone; the caller's prior is_closed check
+        // should have surfaced the closed state already.
     }
 
     #[inline]
@@ -763,7 +972,13 @@ impl<T: TokioConn> MuxState<T> {
         stream_id: u32,
     ) -> Poll<MuxResult<()>> {
         self.check_closed()?;
-        let handle = self.handles.get_mut(&stream_id).unwrap();
+        debug_assert!(
+            self.handles.contains_key(&stream_id),
+            "poll_flush_stream_frames called with unknown stream id {stream_id}"
+        );
+        let Some(handle) = self.handles.get_mut(&stream_id) else {
+            return Poll::Ready(Ok(()));
+        };
         if handle.tx_queue.is_empty() {
             Poll::Ready(Ok(()))
         } else {
@@ -785,12 +1000,50 @@ impl<T: TokioConn> MuxState<T> {
         }
     }
 
+    /// Initiate an orderly shutdown: signal the sender to drain anything
+    /// still queued, then hard-close. Idempotent.
     fn close(&mut self) {
+        if self.closed || self.shutdown_requested {
+            return;
+        }
+        self.shutdown_requested = true;
+        // Reject any new SYN from the peer once shutdown has been
+        // requested; the dispatcher would otherwise queue late streams
+        // that nobody can ever accept.
+        self.accept_closed = true;
+        self.notify_accept_stream();
+        // Tell the sender to wake up: it will drain remaining frames and
+        // then call hard_close to actually tear things down.
+        self.notify_should_tx();
+        // If there's truly nothing left to flush - including Framed's own
+        // BytesMut write buffer, which holds bytes that have been
+        // start_send'd but not yet written to the underlying transport -
+        // jump straight to hard close. Skipping the Framed check here is
+        // unsafe: hard_close drops Framed without flushing it, so any
+        // bytes still in the BytesMut are lost.
+        let nothing_pending = self.tx_queue.is_empty()
+            && self.handles.values().all(|h| h.tx_queue.is_empty())
+            && self.inner.write_buffer().is_empty();
+        if nothing_pending {
+            self.hard_close();
+        }
+    }
+
+    /// Immediate teardown: wake all wakers, mark every handle closed, and
+    /// drop any pending data. Used for connection errors and as the
+    /// final stage of orderly shutdown.
+    fn hard_close(&mut self) {
+        if self.closed {
+            return;
+        }
         self.closed = true;
         // Wake up everyone
         self.notify_accept_stream();
         self.notify_rx_consumed();
         self.notify_should_tx();
+        if let Some(w) = self.close_waker.take() {
+            w.wake();
+        }
         for (_, h) in self.handles.iter_mut() {
             h.closed = true;
             h.notify_rx_ready();
@@ -807,25 +1060,51 @@ impl<T: TokioConn> MuxState<T> {
     }
 
     fn poll_flush_frames(&mut self, cx: &mut Context<'_>) -> Poll<MuxResult<()>> {
-        // Global queue
-        // Flush control frames first
+        // Global queue first - control frames (SYN/FIN/NOP) take priority.
         while !self.tx_queue.is_empty() {
             ready!(self.poll_write_ready(cx))?;
             let frame = self.tx_queue.pop_front().unwrap();
             self.write_frame(frame)?;
         }
 
-        // Stream queues
-        // Flush pending stream packets
-        for (_, h) in self
-            .handles
-            .iter_mut()
-            .filter(|(_, h)| !h.tx_queue.is_empty())
-        {
-            while !h.tx_queue.is_empty() {
+        // Round-robin across per-stream tx_queues. Each outer pass pops at
+        // most one frame from each non-empty stream, so a single noisy
+        // stream can no longer starve smaller ones (head-of-line blocking
+        // inside the worker). We also defer notify_tx_done until a
+        // stream's queue actually drains, instead of waking the writer
+        // after every single frame.
+        loop {
+            let ids: Vec<u32> = self
+                .handles
+                .iter()
+                .filter(|(_, h)| !h.tx_queue.is_empty())
+                .map(|(id, _)| *id)
+                .collect();
+            if ids.is_empty() {
+                break;
+            }
+            let mut sent_any = false;
+            for sid in ids {
+                // poll_ready must come *before* the pop; otherwise a Pending
+                // return would silently drop the frame.
                 ready!(Pin::new(&mut self.inner).poll_ready(cx))?;
-                Pin::new(&mut self.inner).start_send(h.tx_queue.pop_front().unwrap())?;
-                h.notify_tx_done();
+                let (frame, drained) = if let Some(h) = self.handles.get_mut(&sid) {
+                    let f = h.tx_queue.pop_front();
+                    (f, h.tx_queue.is_empty())
+                } else {
+                    (None, false)
+                };
+                let Some(frame) = frame else { continue };
+                Pin::new(&mut self.inner).start_send(frame)?;
+                sent_any = true;
+                if drained {
+                    if let Some(h) = self.handles.get_mut(&sid) {
+                        h.notify_tx_done();
+                    }
+                }
+            }
+            if !sent_any {
+                break;
             }
         }
 
@@ -843,5 +1122,62 @@ impl<T: TokioConn> MuxState<T> {
         } else {
             Poll::Ready(())
         }
+    }
+}
+
+#[cfg(test)]
+mod alloc_tests {
+    use super::*;
+    use crate::config::StreamIdType;
+    use std::num::Wrapping;
+
+    fn fresh_state(stream_id_type: StreamIdType) -> MuxState<tokio::io::DuplexStream> {
+        // Construct a state without going through mux_connection so we can
+        // poke at alloc_stream_id directly. The TokioConn we feed in is
+        // unused by alloc_stream_id.
+        let (a, _b) = tokio::io::duplex(64);
+        MuxState {
+            inner: Framed::new(a, MuxCodec {}),
+            handles: HashMap::new(),
+            accept_queue: VecDeque::new(),
+            accept_waker: None,
+            tx_queue: VecDeque::new(),
+            should_tx_waker: None,
+            rx_consumed_waker: None,
+            closed: false,
+            accept_closed: false,
+            public_handles: 0,
+            stream_id_hint: Wrapping(stream_id_type as u32),
+            stream_id_type,
+            idle_timeout: None,
+            keep_alive_timeout: None,
+            last_rx: Instant::now(),
+            max_tx_queue: 1024,
+            max_rx_queue: 1024,
+            shutdown_requested: false,
+            close_waker: None,
+            closing_inline: false,
+        }
+    }
+
+    // BUG: with stream_id_hint = Wrapping(0) (Even side), repeated alloc
+    // wraps from u32::MAX-1 to 0. Stream id 0 is reserved for NOP keep-alive,
+    // so alloc must skip it.
+    #[test]
+    fn alloc_stream_id_never_returns_zero_after_wrap() {
+        let mut s = fresh_state(StreamIdType::Even);
+        // Simulate already having consumed almost the full id space.
+        s.stream_id_hint = Wrapping(u32::MAX - 1);
+        let id = s.alloc_stream_id().unwrap();
+        assert_ne!(id, 0, "stream id 0 is reserved and must not be allocated");
+    }
+
+    // BUG: peer should also not be allowed to use stream id 0 in SYN.
+    #[test]
+    fn process_sync_rejects_zero_stream_id() {
+        // local Odd, so peer-Even (0) is otherwise parity-valid.
+        let mut s = fresh_state(StreamIdType::Odd);
+        let res = s.process_sync(0, Direction::Rx);
+        assert!(res.is_err(), "SYN with stream id 0 must be rejected");
     }
 }

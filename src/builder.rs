@@ -28,6 +28,7 @@ impl MuxBuilder<Begin> {
                 config: MuxConfig {
                     stream_id_type: StreamIdType::Odd,
                     keep_alive_interval: None,
+                    keep_alive_timeout: None,
                     idle_timeout: None,
                     max_tx_queue: NonZeroUsize::new(1024).unwrap(),
                     max_rx_queue: NonZeroUsize::new(1024).unwrap(),
@@ -42,6 +43,7 @@ impl MuxBuilder<Begin> {
                 config: MuxConfig {
                     stream_id_type: StreamIdType::Even,
                     keep_alive_interval: None,
+                    keep_alive_timeout: None,
                     idle_timeout: None,
                     max_tx_queue: NonZeroUsize::new(1024).unwrap(),
                     max_rx_queue: NonZeroUsize::new(1024).unwrap(),
@@ -54,6 +56,14 @@ impl MuxBuilder<Begin> {
 impl MuxBuilder<WithConfig> {
     pub fn with_keep_alive_interval(&mut self, interval_secs: NonZeroU64) -> &mut Self {
         self.state.config.keep_alive_interval = Some(interval_secs);
+        self
+    }
+
+    /// Maximum gap between received frames before the peer is declared dead
+    /// and the connection closed. Only consulted when keep-alive is also
+    /// enabled. Defaults to 3 * `keep_alive_interval`.
+    pub fn with_keep_alive_timeout(&mut self, timeout_secs: NonZeroU64) -> &mut Self {
+        self.state.config.keep_alive_timeout = Some(timeout_secs);
         self
     }
 

@@ -10,10 +10,14 @@ pub enum MuxError {
     InvalidVersion(u8),
     #[error("Payload too large {0}")]
     PayloadTooLarge(usize),
+    #[error("Control frame must have empty payload, got length {0}")]
+    InvalidControlFramePayload(u16),
+    #[error("Reserved stream id {0}")]
+    ReservedStreamId(u32),
     #[error("Duplicated stream id {0}")]
     DuplicatedStreamId(u32),
 
-    #[error("Invalid stream ID from peer: {0}, local stream ID type: {0:?}")]
+    #[error("Invalid stream ID from peer: {0}, local stream ID type: {1:?}")]
     InvalidPeerStreamIdType(u32, StreamIdType),
 
     #[error("Too many streams")]

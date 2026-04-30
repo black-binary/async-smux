@@ -105,6 +105,15 @@ impl Decoder for MuxCodec {
         if src.len() < HEADER_SIZE + len {
             return Ok(None);
         }
+        // Per smux v1, only PSH carries payload; SYN/FIN/NOP must be empty.
+        // Reject non-empty control frames so a peer cannot use them for
+        // bandwidth amplification or covert framing.
+        match header.command {
+            MuxCommand::Sync | MuxCommand::Finish | MuxCommand::Nop if header.length != 0 => {
+                return Err(MuxError::InvalidControlFramePayload(header.length));
+            }
+            _ => {}
+        }
         src.advance(HEADER_SIZE);
         let payload = src.split_to(len).freeze();
 
