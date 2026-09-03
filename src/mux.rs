@@ -85,11 +85,10 @@ pub struct MuxConnector<T: TokioConn> {
     state: Arc<Mutex<MuxState<T>>>,
 }
 
-/// Resets `closing_inline` if `MuxConnector::close` is dropped before
+/// Releases one inline-close claim if `MuxConnector::close` is dropped before
 /// it finishes. On normal completion, hard_close has already set
-/// `state.closed=true` and the sender exits via `check_closed`, so the
-/// reset is a no-op. On cancellation, this hands control of Framed back
-/// to the sender so the worker can still make progress.
+/// `state.closed=true`. On cancellation, another close waiter is woken; when
+/// the last inline closer goes away, control of Framed returns to the sender.
 struct CloseGuard<'a, T: TokioConn> {
     state: &'a Arc<Mutex<MuxState<T>>>,
 }
@@ -97,9 +96,14 @@ struct CloseGuard<'a, T: TokioConn> {
 impl<T: TokioConn> Drop for CloseGuard<'_, T> {
     fn drop(&mut self) {
         let mut state = self.state.lock();
+        if state.inline_closers > 0 {
+            state.inline_closers -= 1;
+        }
         if !state.closed {
-            state.closing_inline = false;
-            state.notify_should_tx();
+            state.notify_close_waiters();
+            if state.inline_closers == 0 {
+                state.notify_should_tx();
+            }
         }
     }
 }
@@ -113,7 +117,7 @@ impl<T: TokioConn> MuxConnector<T> {
     /// available.
     pub fn connect(&self) -> MuxResult<MuxStream<T>> {
         let mut state = self.state.lock();
-        state.check_closed()?;
+        state.check_accepting_work()?;
 
         let stream_id = state.alloc_stream_id()?;
         state.process_sync(stream_id, Direction::Tx)?;
@@ -144,30 +148,24 @@ impl<T: TokioConn> MuxConnector<T> {
         {
             let mut state = self.state.lock();
             state.close();
-            // Take ownership of Framed for the rest of close(). The
-            // sender will see this flag at the top of its loop and bow
-            // out, leaving Framed's single waker slot to us. The mutex
-            // already serializes physical access; this flag avoids
-            // logical wakeup loss between the two actors.
-            state.closing_inline = true;
+            // Claim inline ownership of Framed for the rest of close(). The
+            // sender bows out while at least one closer is active, leaving
+            // Framed's sink waker slot to the close futures.
+            state.inline_closers += 1;
         }
         // RAII guard: if this future is dropped (e.g. select! with a
-        // timeout) before close() finishes, reset closing_inline so the
-        // sender takes over again. Without this the sender would stay
-        // permanently parked on closing_inline=true and the worker would
-        // hang.
-        let _guard = CloseGuard {
-            state: &self.state,
-        };
+        // timeout), release its inline claim and wake another closer or the
+        // sender so shutdown cannot become wedged.
+        let _guard = CloseGuard { state: &self.state };
         poll_fn(|cx| {
             let mut state = self.state.lock();
             // Save waker so an externally-driven hard_close (dispatcher
             // error, transport failure) can wake us if it happens to
             // race ahead of our own progress here.
-            state.close_waker = Some(cx.waker().clone());
             if state.closed {
                 return Poll::Ready(Ok(()));
             }
+            state.register_close_waker(cx);
             // Drain → flush → close, ourselves. This makes close() not
             // depend on the worker still being polled.
             match state.poll_flush_frames(cx) {
@@ -186,7 +184,11 @@ impl<T: TokioConn> MuxConnector<T> {
                 }
                 Poll::Pending => return Poll::Pending,
             }
-            match state.inner.poll_close_unpin(cx) {
+            let close_result = match state.inner.as_mut() {
+                Some(inner) => inner.poll_close_unpin(cx),
+                None => Poll::Ready(Err(MuxError::ConnectionClosed)),
+            };
+            match close_result {
                 Poll::Ready(Ok(())) => {
                     state.hard_close();
                     Poll::Ready(Ok(()))
@@ -204,12 +206,17 @@ impl<T: TokioConn> MuxConnector<T> {
     /// Number of streams currently open on this session (in either
     /// direction).
     pub fn get_num_streams(&self) -> usize {
-        self.state.lock().handles.len()
+        self.state
+            .lock()
+            .handles
+            .values()
+            .filter(|handle| !handle.closed)
+            .count()
     }
 
     #[cfg(test)]
     pub(crate) fn is_closing_inline(&self) -> bool {
-        self.state.lock().closing_inline
+        self.state.lock().inline_closers > 0
     }
 }
 
@@ -257,11 +264,12 @@ impl<T: TokioConn> Stream for MuxAcceptor<T> {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let mut state = self.state.lock();
-        if state.check_closed().is_err() {
+        if state.closed || state.shutdown_requested {
             return Poll::Ready(None);
         }
 
         if let Some(stream_id) = state.accept_queue.pop_front() {
+            state.notify_rx_consumed();
             state.public_handles += 1;
             let stream = MuxStream {
                 stream_id,
@@ -313,6 +321,17 @@ impl<T: TokioConn> Future for MuxTimer<T> {
 
             let mut state = this.state.lock();
 
+            if state.closed {
+                return Poll::Ready(Err(MuxError::ConnectionClosed));
+            }
+            // An orderly close owns the carrier's write side and deliberately
+            // stops accepting new work. Do not append periodic frames while
+            // it is draining, or a timer tick could write after poll_shutdown
+            // has already started.
+            if state.shutdown_requested {
+                return Poll::Pending;
+            }
+
             // Ping send
             if is_ping_send_needs {
                 state.enqueue_frame_global(MuxFrame::new(MuxCommand::Nop, 0, Bytes::new()));
@@ -324,7 +343,13 @@ impl<T: TokioConn> Future for MuxTimer<T> {
             // the connection as dead and tear everything down so callers
             // unblock instead of hanging on a half-open socket.
             if let Some(timeout) = state.keep_alive_timeout {
-                if Instant::now().duration_since(state.last_rx) >= timeout {
+                // When the configured RX budget is exhausted, the dispatcher
+                // intentionally does not poll the carrier. Silence cannot be
+                // used as evidence of a dead peer until application reads or
+                // accepts enough work for dispatching to resume.
+                if !state.rx_backpressured
+                    && Instant::now().duration_since(state.last_rx) >= timeout
+                {
                     state.hard_close();
                     return Poll::Ready(Err(MuxError::ConnectionClosed));
                 }
@@ -337,7 +362,7 @@ impl<T: TokioConn> Future for MuxTimer<T> {
                     .handles
                     .iter()
                     .filter_map(|(id, h)| {
-                        if now.duration_since(h.last_active) >= timeout {
+                        if !h.closed && now.duration_since(h.last_active) >= timeout {
                             Some(*id)
                         } else {
                             None
@@ -346,9 +371,30 @@ impl<T: TokioConn> Future for MuxTimer<T> {
                     .collect::<Vec<_>>();
 
                 for stream_id in dead_ids {
-                    state.try_mark_finish(stream_id);
-                    state.send_finish(stream_id);
-                    state.notify_rx_consumed();
+                    if let Some(position) = state
+                        .accept_queue
+                        .iter()
+                        .position(|queued| *queued == stream_id)
+                    {
+                        // An unaccepted stream cannot have local writes, so
+                        // its FIN can go directly to the control queue before
+                        // the handle is reaped.
+                        state.try_mark_finish(stream_id);
+                        state.send_finish(stream_id);
+                        state.accept_queue.remove(position);
+                        state.remove_stream(stream_id);
+                    } else {
+                        // Keep FIN behind PSHs already accepted for an active
+                        // stream. Putting it in the global control queue would
+                        // let it overtake the stream's pending data.
+                        state.try_mark_finish(stream_id);
+                        state.enqueue_frame_stream(
+                            stream_id,
+                            MuxFrame::new(MuxCommand::Finish, stream_id, Bytes::new()),
+                        );
+                        state.notify_should_tx();
+                        state.notify_rx_consumed();
+                    }
                 }
             }
         }
@@ -373,16 +419,19 @@ impl<T: TokioConn> Future for MuxSender<T> {
             state.check_closed()?;
             // MuxConnector::close drives Framed inline; stay out of the
             // way. We'll be re-woken by hard_close via should_tx_waker.
-            if state.closing_inline {
+            if state.inline_closers > 0 {
                 return Poll::Pending;
             }
             ready!(state.poll_flush_frames(cx)).inspect_err(|_| state.hard_close())?;
             ready!(state.poll_flush_inner(cx)).inspect_err(|_| state.hard_close())?;
             // After draining, finalize an orderly shutdown if one was
-            // requested. Closing the inner sink lets the dispatcher's
-            // poll_next observe EOF and exit cleanly.
+            // requested. hard_close then wakes the parked dispatcher and all
+            // public handles.
             if state.shutdown_requested && !state.closed {
-                let res = state.inner.poll_close_unpin(cx);
+                let res = match state.inner.as_mut() {
+                    Some(inner) => inner.poll_close_unpin(cx),
+                    None => Poll::Ready(Err(MuxError::ConnectionClosed)),
+                };
                 if let Poll::Ready(r) = res {
                     state.hard_close();
                     return Poll::Ready(r);
@@ -420,8 +469,16 @@ impl<T: TokioConn> Future for MuxDispatcher<T> {
         loop {
             let mut state = self.state.lock();
             state.check_closed()?;
+            // Once orderly shutdown begins, the close driver is the only
+            // actor that may poll the carrier. Besides preventing late peer
+            // frames from generating new replies, this avoids replacing a
+            // close future's transport waker with the worker's read waker.
+            if state.shutdown_requested {
+                return Poll::Pending;
+            }
 
-            ready!(state.poll_ready_rx_consumed(cx)); // Can stuck here forever, be careful
+            // Apply session-wide backpressure before reading another frame.
+            ready!(state.poll_ready_rx_consumed(cx));
 
             let frame = ready!(state.poll_next_frame(cx)).inspect_err(|_| state.hard_close())?;
             // Refresh peer-liveness clock on every successfully-decoded
@@ -491,8 +548,8 @@ impl<T: TokioConn> Future for MuxWorker<T> {
 /// A bi-directional stream multiplexed over the session. Implements
 /// `AsyncRead + AsyncWrite + Unpin`, so it can be used anywhere a
 /// `TcpStream` would. Dropping it without `shutdown()` is fine — the
-/// stream's pending tx queue is moved to the global queue and a FIN
-/// is enqueued so the peer sees a clean close.
+/// stream's pending tx queue is moved to the global queue, and a FIN is
+/// enqueued when neither the peer nor the session has already closed it.
 pub struct MuxStream<T: TokioConn> {
     stream_id: u32,
     state: Arc<Mutex<MuxState<T>>>,
@@ -502,22 +559,32 @@ pub struct MuxStream<T: TokioConn> {
 impl<T: TokioConn> Drop for MuxStream<T> {
     fn drop(&mut self) {
         let mut state = self.state.lock();
-        if !state.is_closed(self.stream_id) {
-            // The user did not call `shutdown()`. Anything still queued in
-            // the per-stream tx_queue would otherwise be dropped together
-            // with the StreamHandle below, so move it onto the global
-            // tx_queue first, then enqueue FIN after, so the wire sees
-            // PSH... PSH FIN in order. Handle is guaranteed to exist here
-            // — is_closed just asserted it.
-            let h = state.handles.get_mut(&self.stream_id).unwrap();
-            let drained: VecDeque<MuxFrame> = std::mem::take(&mut h.tx_queue);
+        if !state.closed {
+            // Preserve every frame already accepted by poll_write even when a
+            // remote FIN raced with Drop. Whether we need to originate our own
+            // FIN is separate from whether accepted data must be drained.
+            let may_send_finish = !state.shutdown_requested;
+            let (drained, should_send_finish) = state
+                .handles
+                .get_mut(&self.stream_id)
+                .map(|h| {
+                    (
+                        std::mem::take(&mut h.tx_queue),
+                        may_send_finish && !h.closed,
+                    )
+                })
+                .unwrap_or_default();
             state.tx_queue.extend(drained);
-            state.enqueue_frame_global(MuxFrame::new(
-                MuxCommand::Finish,
-                self.stream_id,
-                Bytes::new(),
-            ));
-            state.notify_should_tx();
+            if should_send_finish {
+                state.enqueue_frame_global(MuxFrame::new(
+                    MuxCommand::Finish,
+                    self.stream_id,
+                    Bytes::new(),
+                ));
+            }
+            if should_send_finish || !state.tx_queue.is_empty() {
+                state.notify_should_tx();
+            }
         }
         state.remove_stream(self.stream_id);
         state.dec_public_handles();
@@ -530,6 +597,10 @@ impl<T: TokioConn> AsyncRead for MuxStream<T> {
         cx: &mut Context<'_>,
         buf: &mut io::ReadBuf<'_>,
     ) -> Poll<StdIo::Result<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+
         loop {
             if let Some(read_buffer) = &mut self.read_buffer {
                 if read_buffer.len() <= buf.remaining() {
@@ -548,7 +619,9 @@ impl<T: TokioConn> AsyncRead for MuxStream<T> {
 
             if let Some(frame) = frame {
                 debug_assert_eq!(frame.header.command, MuxCommand::Push);
-                self.read_buffer = Some(frame.payload);
+                if !frame.payload.is_empty() {
+                    self.read_buffer = Some(frame.payload);
+                }
             } else {
                 // EOF
                 return Poll::Ready(Ok(()));
@@ -559,7 +632,7 @@ impl<T: TokioConn> AsyncRead for MuxStream<T> {
 
 #[inline]
 fn mux_to_io_err(e: MuxError) -> StdIo::Error {
-    StdIo::Error::new(ErrorKind::Other, e)
+    StdIo::Error::other(e)
 }
 
 #[inline]
@@ -573,6 +646,10 @@ impl<T: TokioConn> AsyncWrite for MuxStream<T> {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<Result<usize, StdIo::Error>> {
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+
         let mut state = self.state.lock();
         if state.is_closed(self.stream_id) {
             return Poll::Ready(Err(new_io_err(
@@ -629,15 +706,19 @@ impl<T: TokioConn> AsyncWrite for MuxStream<T> {
             }
 
             state.try_mark_finish(self.stream_id);
-            state.send_finish(self.stream_id);
+            state.enqueue_frame_stream(
+                self.stream_id,
+                MuxFrame::new(MuxCommand::Finish, self.stream_id, Bytes::new()),
+            );
+            state.notify_should_tx();
         }
     }
 }
 
 impl<T: TokioConn> MuxStream<T> {
     /// True once the stream has received FIN, the session has hard-
-    /// closed, or an idle timeout reaped the handle.
-    pub fn is_closed(&mut self) -> bool {
+    /// closed, or an idle timeout has closed the stream.
+    pub fn is_closed(&self) -> bool {
         self.state.lock().is_closed(self.stream_id)
     }
 
@@ -652,6 +733,13 @@ struct StreamHandle {
 
     tx_queue: VecDeque<MuxFrame>,
     tx_done_waker: Option<Waker>,
+    /// True after at least one frame for this stream has been handed to
+    /// `Framed`, but before the carrier sink has completed a flush.
+    unflushed: bool,
+    /// Set by `MuxStream::poll_flush`. Requested streams are drained and
+    /// carrier-flushed ahead of ordinary background traffic so a flush on
+    /// one stream cannot be held hostage by every other stream's backlog.
+    flush_requested: bool,
 
     rx_queue: VecDeque<MuxFrame>,
     rx_ready_waker: Option<Waker>,
@@ -663,9 +751,11 @@ impl StreamHandle {
     fn new() -> Self {
         Self {
             closed: false,
-            tx_queue: VecDeque::with_capacity(128),
+            tx_queue: VecDeque::new(),
             tx_done_waker: None,
-            rx_queue: VecDeque::with_capacity(128),
+            unflushed: false,
+            flush_requested: false,
+            rx_queue: VecDeque::new(),
             rx_ready_waker: None,
             last_active: Instant::now(),
         }
@@ -703,7 +793,9 @@ enum Direction {
 }
 
 struct MuxState<T: TokioConn> {
-    inner: Framed<T, MuxCodec>,
+    /// Kept in an Option so hard-close can release the carrier immediately,
+    /// even while public handles still retain the shared MuxState.
+    inner: Option<Framed<T, MuxCodec>>,
     handles: HashMap<u32, StreamHandle>,
 
     accept_queue: VecDeque<u32>,
@@ -712,9 +804,8 @@ struct MuxState<T: TokioConn> {
     tx_queue: VecDeque<MuxFrame>,
     should_tx_waker: Option<Waker>,
     rx_consumed_waker: Option<Waker>,
-    /// Wakes whoever is awaiting on hard_close completion (currently
-    /// MuxConnector::close).
-    close_waker: Option<Waker>,
+    /// Wakes every connector awaiting hard-close completion.
+    close_wakers: Vec<Waker>,
 
     closed: bool,
     /// Soft-close requested: drain everything that's already queued, then
@@ -722,14 +813,11 @@ struct MuxState<T: TokioConn> {
     /// teardown) so that user-initiated shutdown does not lose pending FIN
     /// / PSH frames already enqueued by Drop impls.
     shutdown_requested: bool,
-    /// Set while `MuxConnector::close` is driving Framed itself. The
-    /// sender steps out of the way on this flag so that close() can
-    /// finish even when the worker isn't being polled (e.g. the user
-    /// forgot to spawn it, or it has already exited). The mutex
-    /// serializes access to Framed; the flag prevents close()/sender
-    /// from clobbering each other's wakers on Framed's single waker
-    /// slot.
-    closing_inline: bool,
+    /// Number of `MuxConnector::close` futures driving Framed inline. The
+    /// sender steps out of the way while this is non-zero, so close() can
+    /// finish even when the worker is not being polled. Counting claims keeps
+    /// cancellation of one concurrent closer from releasing another's claim.
+    inline_closers: usize,
     accept_closed: bool,
     public_handles: usize,
 
@@ -743,6 +831,9 @@ struct MuxState<T: TokioConn> {
     keep_alive_timeout: Option<Duration>,
     /// Last time the dispatcher successfully decoded a frame from the peer.
     last_rx: Instant,
+    /// True while the dispatcher has intentionally stopped polling the
+    /// carrier because the session-wide receive budget is exhausted.
+    rx_backpressured: bool,
 
     max_tx_queue: usize,
     max_rx_queue: usize,
@@ -767,17 +858,17 @@ impl<T: TokioConn> MuxState<T> {
             Duration::from_secs(secs)
         });
         Self {
-            inner,
+            inner: Some(inner),
             handles: HashMap::new(),
             accept_queue: VecDeque::new(),
             accept_waker: None,
             tx_queue: VecDeque::with_capacity(config.max_tx_queue.get()),
             should_tx_waker: None,
             rx_consumed_waker: None,
-            close_waker: None,
+            close_wakers: Vec::new(),
             closed: false,
             shutdown_requested: false,
-            closing_inline: false,
+            inline_closers: 0,
             accept_closed: false,
             public_handles: 0,
             stream_id_hint: Wrapping(config.stream_id_type as u32),
@@ -785,6 +876,7 @@ impl<T: TokioConn> MuxState<T> {
             idle_timeout: config.idle_timeout.map(|n| Duration::from_secs(n.get())),
             keep_alive_timeout,
             last_rx: Instant::now(),
+            rx_backpressured: false,
             max_tx_queue: config.max_tx_queue.get(),
             max_rx_queue: config.max_rx_queue.get(),
         }
@@ -891,9 +983,13 @@ impl<T: TokioConn> MuxState<T> {
             if handle.closed {
                 return false;
             }
-            handle.rx_queue.push_back(frame);
-            handle.notify_rx_ready();
             handle.last_active = Instant::now();
+            // A zero-length PSH carries no data. Queuing it would make a
+            // non-empty AsyncRead return zero and falsely signal EOF.
+            if !frame.payload.is_empty() {
+                handle.rx_queue.push_back(frame);
+                handle.notify_rx_ready();
+            }
             true
         } else {
             false
@@ -902,19 +998,27 @@ impl<T: TokioConn> MuxState<T> {
 
     #[inline]
     fn get_rx_pending(&mut self) -> usize {
-        self.handles
-            .values()
-            .filter(|h| !h.closed)
-            .map(|h| h.rx_queue.len())
-            .sum()
+        self.accept_queue.len()
+            + self
+                .handles
+                .values()
+                .map(|h| h.rx_queue.len())
+                .sum::<usize>()
     }
 
     fn poll_ready_rx_consumed(&mut self, cx: &Context<'_>) -> Poll<()> {
         let pending = self.get_rx_pending();
-        if pending > self.max_rx_queue {
+        if pending >= self.max_rx_queue {
+            self.rx_backpressured = true;
             self.register_rx_consumed_waker(cx);
             Poll::Pending
         } else {
+            if std::mem::replace(&mut self.rx_backpressured, false) {
+                // No peer liveness observations were possible while reads
+                // were parked. Give the resumed dispatcher a fresh timeout
+                // window instead of immediately closing on stale last_rx.
+                self.last_rx = Instant::now();
+            }
             Poll::Ready(())
         }
     }
@@ -932,7 +1036,10 @@ impl<T: TokioConn> MuxState<T> {
     }
 
     fn poll_next_frame(&mut self, cx: &mut Context<'_>) -> Poll<MuxResult<MuxFrame>> {
-        if let Some(r) = ready!(self.inner.poll_next_unpin(cx)) {
+        let Some(inner) = self.inner.as_mut() else {
+            return Poll::Ready(Err(MuxError::ConnectionClosed));
+        };
+        if let Some(r) = ready!(inner.poll_next_unpin(cx)) {
             let frame = r?;
             Poll::Ready(Ok(frame))
         } else {
@@ -941,17 +1048,20 @@ impl<T: TokioConn> MuxState<T> {
     }
 
     #[inline]
-    fn pin_inner(&mut self) -> Pin<&mut Framed<T, MuxCodec>> {
-        Pin::new(&mut self.inner)
+    fn pin_inner(&mut self) -> MuxResult<Pin<&mut Framed<T, MuxCodec>>> {
+        self.inner
+            .as_mut()
+            .map(Pin::new)
+            .ok_or(MuxError::ConnectionClosed)
     }
 
     fn poll_write_ready(&mut self, cx: &mut Context<'_>) -> Poll<MuxResult<()>> {
-        ready!(self.pin_inner().poll_ready(cx))?;
+        ready!(self.pin_inner()?.poll_ready(cx))?;
         Poll::Ready(Ok(()))
     }
 
     fn write_frame(&mut self, frame: MuxFrame) -> MuxResult<()> {
-        self.pin_inner().start_send(frame)?;
+        self.pin_inner()?.start_send(frame)?;
         Ok(())
     }
 
@@ -984,7 +1094,7 @@ impl<T: TokioConn> MuxState<T> {
     }
 
     fn poll_stream_write_ready(&mut self, cx: &Context<'_>, stream_id: u32) -> Poll<MuxResult<()>> {
-        self.check_closed()?;
+        self.check_accepting_work()?;
         debug_assert!(
             self.handles.contains_key(&stream_id),
             "poll_stream_write_ready called with unknown stream id {stream_id}"
@@ -992,7 +1102,7 @@ impl<T: TokioConn> MuxState<T> {
         let Some(handle) = self.handles.get_mut(&stream_id) else {
             return Poll::Ready(Err(MuxError::StreamClosed(stream_id)));
         };
-        if handle.tx_queue.len() > self.max_tx_queue {
+        if handle.tx_queue.len() >= self.max_tx_queue {
             // A stream's tx queue is full
             handle.register_tx_done_waker(cx);
             // Notify the worker to transfer data now
@@ -1040,6 +1150,18 @@ impl<T: TokioConn> MuxState<T> {
         }
     }
 
+    fn register_close_waker(&mut self, cx: &Context<'_>) {
+        if !self.close_wakers.iter().any(|w| w.will_wake(cx.waker())) {
+            self.close_wakers.push(cx.waker().clone());
+        }
+    }
+
+    fn notify_close_waiters(&mut self) {
+        for waker in self.close_wakers.drain(..) {
+            waker.wake();
+        }
+    }
+
     fn poll_flush_stream_frames(
         &mut self,
         cx: &mut Context<'_>,
@@ -1053,9 +1175,10 @@ impl<T: TokioConn> MuxState<T> {
         let Some(handle) = self.handles.get_mut(&stream_id) else {
             return Poll::Ready(Ok(()));
         };
-        if handle.tx_queue.is_empty() {
+        if handle.tx_queue.is_empty() && !handle.unflushed {
             Poll::Ready(Ok(()))
         } else {
+            handle.flush_requested = true;
             handle.register_tx_done_waker(cx);
             self.notify_should_tx();
             Poll::Pending
@@ -1085,22 +1208,24 @@ impl<T: TokioConn> MuxState<T> {
         // requested; the dispatcher would otherwise queue late streams
         // that nobody can ever accept.
         self.accept_closed = true;
+        // No public stream exists for queued accepts. Release them now; the
+        // carrier close supersedes per-stream FIN replies.
+        while let Some(stream_id) = self.accept_queue.pop_front() {
+            self.handles.remove(&stream_id);
+        }
+        self.notify_rx_consumed();
+        // Close every exposed stream logically at the start of shutdown so
+        // reads/writes wake immediately. Their already-accepted tx queues are
+        // retained and will still be drained by poll_flush_frames.
+        for handle in self.handles.values_mut() {
+            handle.closed = true;
+            handle.notify_rx_ready();
+            handle.notify_tx_done();
+        }
         self.notify_accept_stream();
         // Tell the sender to wake up: it will drain remaining frames and
         // then call hard_close to actually tear things down.
         self.notify_should_tx();
-        // If there's truly nothing left to flush - including Framed's own
-        // BytesMut write buffer, which holds bytes that have been
-        // start_send'd but not yet written to the underlying transport -
-        // jump straight to hard close. Skipping the Framed check here is
-        // unsafe: hard_close drops Framed without flushing it, so any
-        // bytes still in the BytesMut are lost.
-        let nothing_pending = self.tx_queue.is_empty()
-            && self.handles.values().all(|h| h.tx_queue.is_empty())
-            && self.inner.write_buffer().is_empty();
-        if nothing_pending {
-            self.hard_close();
-        }
     }
 
     /// Immediate teardown: wake all wakers, mark every handle closed, and
@@ -1111,15 +1236,24 @@ impl<T: TokioConn> MuxState<T> {
             return;
         }
         self.closed = true;
+        // Releasing the carrier here is important: public handles may remain
+        // alive indefinitely after a timeout/error and must not keep the
+        // underlying socket open.
+        self.inner.take();
+        self.tx_queue = VecDeque::new();
+        // No MuxStream exists for these queued ids yet, so they can be
+        // released immediately rather than retained by a closed acceptor.
+        while let Some(stream_id) = self.accept_queue.pop_front() {
+            self.handles.remove(&stream_id);
+        }
         // Wake up everyone
         self.notify_accept_stream();
         self.notify_rx_consumed();
         self.notify_should_tx();
-        if let Some(w) = self.close_waker.take() {
-            w.wake();
-        }
-        for (_, h) in self.handles.iter_mut() {
+        self.notify_close_waiters();
+        for h in self.handles.values_mut() {
             h.closed = true;
+            h.tx_queue = VecDeque::new();
             h.notify_rx_ready();
             h.notify_tx_done();
         }
@@ -1127,6 +1261,14 @@ impl<T: TokioConn> MuxState<T> {
 
     fn check_closed(&self) -> MuxResult<()> {
         if self.closed {
+            Err(MuxError::ConnectionClosed)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn check_accepting_work(&self) -> MuxResult<()> {
+        if self.closed || self.shutdown_requested {
             Err(MuxError::ConnectionClosed)
         } else {
             Ok(())
@@ -1141,12 +1283,44 @@ impl<T: TokioConn> MuxState<T> {
             self.write_frame(frame)?;
         }
 
+        // A stream actively waiting in poll_flush gets a real carrier flush
+        // boundary before unrelated background queues are drained. Besides
+        // matching AsyncWrite::flush semantics, this prevents an unrelated
+        // connection-wide transmit backlog from blocking this stream's flush.
+        loop {
+            let requested = self
+                .handles
+                .iter()
+                .find_map(|(id, h)| h.flush_requested.then_some(*id));
+            let Some(sid) = requested else { break };
+
+            while self
+                .handles
+                .get(&sid)
+                .is_some_and(|h| !h.tx_queue.is_empty())
+            {
+                ready!(self.pin_inner()?.poll_ready(cx))?;
+                let (frame, became_writable) = {
+                    let h = self.handles.get_mut(&sid).unwrap();
+                    let frame = h.tx_queue.pop_front().unwrap();
+                    (frame, h.tx_queue.len() < self.max_tx_queue)
+                };
+                self.pin_inner()?.start_send(frame)?;
+                if let Some(h) = self.handles.get_mut(&sid) {
+                    h.unflushed = true;
+                    if became_writable {
+                        h.notify_tx_done();
+                    }
+                }
+            }
+
+            ready!(self.poll_flush_inner(cx))?;
+        }
+
         // Round-robin across per-stream tx_queues. Each outer pass pops at
         // most one frame from each non-empty stream, so a single noisy
-        // stream can no longer starve smaller ones (head-of-line blocking
-        // inside the worker). We also defer notify_tx_done until a
-        // stream's queue actually drains, instead of waking the writer
-        // after every single frame.
+        // stream cannot monopolize the sender. A writer is woken as soon as
+        // its queue falls below the configured limit.
         loop {
             let ids: Vec<u32> = self
                 .handles
@@ -1161,18 +1335,19 @@ impl<T: TokioConn> MuxState<T> {
             for sid in ids {
                 // poll_ready must come *before* the pop; otherwise a Pending
                 // return would silently drop the frame.
-                ready!(Pin::new(&mut self.inner).poll_ready(cx))?;
-                let (frame, drained) = if let Some(h) = self.handles.get_mut(&sid) {
+                ready!(self.pin_inner()?.poll_ready(cx))?;
+                let (frame, became_writable) = if let Some(h) = self.handles.get_mut(&sid) {
                     let f = h.tx_queue.pop_front();
-                    (f, h.tx_queue.is_empty())
+                    (f, h.tx_queue.len() < self.max_tx_queue)
                 } else {
                     (None, false)
                 };
                 let Some(frame) = frame else { continue };
-                Pin::new(&mut self.inner).start_send(frame)?;
+                self.pin_inner()?.start_send(frame)?;
                 sent_any = true;
-                if drained {
-                    if let Some(h) = self.handles.get_mut(&sid) {
+                if let Some(h) = self.handles.get_mut(&sid) {
+                    h.unflushed = true;
+                    if became_writable {
                         h.notify_tx_done();
                     }
                 }
@@ -1186,7 +1361,22 @@ impl<T: TokioConn> MuxState<T> {
     }
 
     fn poll_flush_inner(&mut self, cx: &mut Context<'_>) -> Poll<MuxResult<()>> {
-        self.inner.poll_flush_unpin(cx)
+        let result = match self.inner.as_mut() {
+            Some(inner) => inner.poll_flush_unpin(cx),
+            None => Poll::Ready(Err(MuxError::ConnectionClosed)),
+        };
+        if matches!(result, Poll::Ready(Ok(()))) {
+            for handle in self.handles.values_mut() {
+                if handle.unflushed {
+                    handle.unflushed = false;
+                }
+                if handle.flush_requested && handle.tx_queue.is_empty() {
+                    handle.flush_requested = false;
+                }
+                handle.notify_tx_done();
+            }
+        }
+        result
     }
 
     fn has_pending_tx(&self) -> bool {
@@ -1234,5 +1424,25 @@ mod alloc_tests {
         let mut s = fresh_state(StreamIdType::Odd);
         let res = s.process_sync(0, Direction::Rx);
         assert!(res.is_err(), "SYN with stream id 0 must be rejected");
+    }
+
+    #[test]
+    fn closed_stream_payload_still_counts_toward_rx_backpressure() {
+        let mut s = fresh_state(StreamIdType::Odd);
+        let stream_id = 2;
+        s.process_sync(stream_id, Direction::Rx).unwrap();
+        assert!(s.recv_push(MuxFrame::new(
+            MuxCommand::Push,
+            stream_id,
+            Bytes::from_static(b"queued")
+        )));
+
+        s.try_mark_finish(stream_id);
+
+        assert_eq!(
+            s.get_rx_pending(),
+            1,
+            "unread payload stopped counting as soon as FIN arrived"
+        );
     }
 }

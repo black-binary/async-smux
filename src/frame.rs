@@ -95,24 +95,35 @@ impl Decoder for MuxCodec {
     type Error = MuxError;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        src.reserve(HEADER_SIZE + MAX_PAYLOAD_SIZE + HEADER_SIZE);
-
         if src.len() < HEADER_SIZE {
+            src.reserve(HEADER_SIZE - src.len());
             return Ok(None);
         }
         let header = MuxFrameHeader::decode(src)?;
-        let len = header.length as usize;
-        if src.len() < HEADER_SIZE + len {
-            return Ok(None);
-        }
         // Per smux v1, only PSH carries payload; SYN/FIN/NOP must be empty.
-        // Reject non-empty control frames so a peer cannot use them for
-        // bandwidth amplification or covert framing.
+        // These checks depend only on the header, so reject immediately rather
+        // than waiting for an invalid peer to deliver its claimed payload.
         match header.command {
             MuxCommand::Sync | MuxCommand::Finish | MuxCommand::Nop if header.length != 0 => {
                 return Err(MuxError::InvalidControlFramePayload(header.length));
             }
             _ => {}
+        }
+        match header.command {
+            MuxCommand::Nop if header.stream_id != 0 => {
+                return Err(MuxError::InvalidNopStreamId(header.stream_id));
+            }
+            MuxCommand::Sync | MuxCommand::Finish | MuxCommand::Push if header.stream_id == 0 => {
+                return Err(MuxError::ReservedStreamId(0));
+            }
+            _ => {}
+        }
+
+        let len = header.length as usize;
+        let frame_len = HEADER_SIZE + len;
+        if src.len() < frame_len {
+            src.reserve(frame_len - src.len());
+            return Ok(None);
         }
         src.advance(HEADER_SIZE);
         let payload = src.split_to(len).freeze();

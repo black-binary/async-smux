@@ -83,23 +83,24 @@ impl MuxBuilder<WithConfig> {
     }
 
     /// Per-stream idle timeout: if a stream sees no traffic for this
-    /// many seconds, it is closed and its handle is reaped.
+    /// many seconds, it is closed.
     pub fn with_idle_timeout(&mut self, timeout_secs: NonZeroU64) -> &mut Self {
         self.state.config.idle_timeout = Some(timeout_secs);
         self
     }
 
-    /// Backpressure threshold for outbound frames. `poll_write` parks
-    /// once a stream's pending tx queue exceeds this value. Defaults
+    /// Backpressure threshold for outbound frames per stream. `poll_write` parks
+    /// once a stream's pending tx queue reaches this value. Defaults
     /// to 1024.
     pub fn with_max_tx_queue(&mut self, size: NonZeroUsize) -> &mut Self {
         self.state.config.max_tx_queue = size;
         self
     }
 
-    /// Backpressure threshold for inbound frames. The dispatcher parks
-    /// once total pending rx exceeds this value, propagating
-    /// backpressure to the peer's tx side. Defaults to 1024.
+    /// Backpressure threshold for inbound frames and streams waiting to be
+    /// accepted. The dispatcher parks once the total reaches this value,
+    /// propagating backpressure to the peer's tx side. Keep-alive expiry is
+    /// suspended while reads are deliberately parked. Defaults to 1024.
     pub fn with_max_rx_queue(&mut self, size: NonZeroUsize) -> &mut Self {
         self.state.config.max_rx_queue = size;
         self
