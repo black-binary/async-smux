@@ -426,6 +426,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_half_close_shutdown_keeps_read_open() {
+        let (client, mut server) = get_duplex_mux_pair().await;
+        let (mut client_reader, mut client_writer) = tokio::io::split(client);
+
+        client_writer.write_all(b"request").await.unwrap();
+        client_writer.shutdown().await.unwrap();
+        assert!(
+            client_writer.write_all(b"late request").await.is_err(),
+            "writes must fail after the local write half is shut down"
+        );
+
+        let mut request = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), server.read_to_end(&mut request))
+            .await
+            .expect("server did not observe EOF from the client write half")
+            .unwrap();
+        assert_eq!(request, b"request");
+
+        server.write_all(b"response").await.unwrap();
+        server.shutdown().await.unwrap();
+
+        let mut response = Vec::new();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            client_reader.read_to_end(&mut response),
+        )
+        .await
+        .expect("client read half closed before the server response")
+        .unwrap();
+        assert_eq!(response, b"response");
+    }
+
+    #[tokio::test]
+    async fn test_half_close_local_fin_waits_for_remote_read_eof() {
+        let (mut local, mut peer) = get_duplex_mux_pair().await;
+
+        local.shutdown().await.unwrap();
+
+        let read_is_pending = poll_fn(|cx| {
+            let mut byte = [0u8; 1];
+            let mut read_buf = ReadBuf::new(&mut byte);
+            Poll::Ready(
+                Pin::new(&mut local)
+                    .poll_read(cx, &mut read_buf)
+                    .is_pending(),
+            )
+        })
+        .await;
+        assert!(
+            read_is_pending,
+            "closing the local write half must not create local read EOF"
+        );
+
+        peer.write_all(b"x").await.unwrap();
+        peer.flush().await.unwrap();
+        let mut byte = [0u8; 1];
+        local.read_exact(&mut byte).await.unwrap();
+        assert_eq!(byte, *b"x");
+
+        peer.shutdown().await.unwrap();
+        assert_eq!(local.read(&mut byte).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_half_close_remote_fin_only_closes_read_direction() {
+        let (mut local, mut peer) = get_duplex_mux_pair().await;
+
+        peer.write_all(b"done").await.unwrap();
+        peer.shutdown().await.unwrap();
+
+        let mut received = Vec::new();
+        local.read_to_end(&mut received).await.unwrap();
+        assert_eq!(received, b"done");
+
+        local.write_all(b"reply after EOF").await.unwrap();
+        local.shutdown().await.unwrap();
+
+        let mut reply = Vec::new();
+        peer.read_to_end(&mut reply).await.unwrap();
+        assert_eq!(reply, b"reply after EOF");
+    }
+
+    #[tokio::test]
+    async fn test_half_close_stream_is_closed_only_after_both_fins() {
+        let (a, b) = tokio::io::duplex(4096);
+        let (connector_a, _acceptor_a, worker_a) = MuxBuilder::client().with_connection(a).build();
+        let (connector_b, mut acceptor_b, worker_b) =
+            MuxBuilder::server().with_connection(b).build();
+        tokio::spawn(worker_a);
+        tokio::spawn(worker_b);
+
+        let mut local = connector_a.connect().unwrap();
+        let mut peer = acceptor_b.accept().await.unwrap();
+        local.shutdown().await.unwrap();
+
+        let mut byte = [0u8; 1];
+        assert_eq!(peer.read(&mut byte).await.unwrap(), 0);
+        assert!(!local.is_closed());
+        assert!(!peer.is_closed());
+        assert_eq!(connector_a.get_num_streams(), 1);
+        assert_eq!(connector_b.get_num_streams(), 1);
+
+        peer.shutdown().await.unwrap();
+        assert_eq!(local.read(&mut byte).await.unwrap(), 0);
+        assert!(local.is_closed());
+        assert!(peer.is_closed());
+        assert_eq!(connector_a.get_num_streams(), 0);
+        assert_eq!(connector_b.get_num_streams(), 0);
+    }
+
+    #[tokio::test]
     async fn test_timeout() {
         let (a, b) = get_tcp_pair().await;
         let (connector_a, _, worker_a) = MuxBuilder::client()
