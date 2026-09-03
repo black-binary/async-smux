@@ -77,7 +77,7 @@ mod tests {
         time::Duration,
     };
 
-    use rand::Rng;
+    use rand::{rngs::StdRng, Rng, RngExt, SeedableRng};
     use tokio::{
         io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
         net::{TcpListener, TcpStream},
@@ -231,6 +231,79 @@ mod tests {
 
         a.shutdown().await.unwrap();
         b.shutdown().await.unwrap();
+    }
+
+    fn next_stress_word(state: &mut u64) -> u64 {
+        // xorshift64*: cheap, deterministic scheduling and chunk variation.
+        // A fixed generator makes a failing stress run exactly reproducible.
+        *state ^= *state >> 12;
+        *state ^= *state << 25;
+        *state ^= *state >> 27;
+        state.wrapping_mul(0x2545_f491_4f6c_dd1d)
+    }
+
+    fn stress_payload(seed: u64, len: usize) -> Vec<u8> {
+        let mut state = seed.max(1);
+        (0..len)
+            .map(|_| next_stress_word(&mut state) as u8)
+            .collect()
+    }
+
+    async fn write_stress_chunks<W: AsyncWrite + Unpin>(writer: &mut W, data: &[u8], seed: u64) {
+        let mut state = seed.max(1);
+        let mut offset = 0;
+        while offset < data.len() {
+            let chunk_len = 1 + next_stress_word(&mut state) as usize % 4096;
+            let end = (offset + chunk_len).min(data.len());
+            writer.write_all(&data[offset..end]).await.unwrap();
+            offset = end;
+            if state & 3 == 0 {
+                tokio::task::yield_now().await;
+            }
+        }
+    }
+
+    fn stress_message(seed: u64, round: usize) -> Vec<u8> {
+        let mixed = seed
+            .wrapping_add((round as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15))
+            .rotate_left((round % 63) as u32);
+        let len = 1 + mixed as usize % 2048;
+        stress_payload(mixed, len)
+    }
+
+    async fn run_full_duplex_stress(
+        stream: MuxStream<tokio::io::DuplexStream>,
+        write_seed: u64,
+        read_seed: u64,
+        rounds: usize,
+        before_shutdown: Arc<tokio::sync::Barrier>,
+    ) {
+        let (mut reader, mut writer) = tokio::io::split(stream);
+        let (write_result, ()) = tokio::join!(
+            async {
+                for round in 0..rounds {
+                    let message = stress_message(write_seed, round);
+                    write_stress_chunks(&mut writer, &message, write_seed ^ round as u64).await;
+                    if round % 7 == 0 {
+                        writer.flush().await.unwrap();
+                    }
+                }
+                writer.flush().await
+            },
+            async {
+                for round in 0..rounds {
+                    let expected = stress_message(read_seed, round);
+                    let mut actual = vec![0; expected.len()];
+                    reader.read_exact(&mut actual).await.unwrap();
+                    assert_eq!(actual, expected, "payload mismatch in round {round}");
+                }
+            }
+        );
+        write_result.unwrap();
+        before_shutdown.wait().await;
+
+        let mut stream = reader.unsplit(writer);
+        stream.shutdown().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1604,5 +1677,436 @@ mod tests {
         // These handles deliberately remain alive until both close futures
         // complete, so hard-close must wake all waiters itself.
         drop((acceptor, worker));
+    }
+
+    async fn run_randomized_lifecycle_stress(batches: usize, streams_per_batch: usize) {
+        const SEED: u64 = 0x5eed_cafe_f00d_beef;
+
+        let (a, b) = tokio::io::duplex(128);
+        let (mut connector_a, _acceptor_a, worker_a) = MuxBuilder::client()
+            .with_max_tx_queue(NonZeroUsize::new(2).unwrap())
+            .with_max_rx_queue(NonZeroUsize::new(8).unwrap())
+            .with_connection(a)
+            .build();
+        let (connector_b, mut acceptor_b, worker_b) = MuxBuilder::server()
+            .with_max_tx_queue(NonZeroUsize::new(2).unwrap())
+            .with_max_rx_queue(NonZeroUsize::new(8).unwrap())
+            .with_connection(b)
+            .build();
+        let worker_a = tokio::spawn(worker_a);
+        let worker_b = tokio::spawn(worker_b);
+        let mut rng = StdRng::seed_from_u64(SEED);
+
+        for batch in 0..batches {
+            let mut clients = tokio::task::JoinSet::new();
+            for slot in 0..streams_per_batch {
+                let case_id = (batch * streams_per_batch + slot) as u64;
+                let payload_len = match case_id % 16 {
+                    0 => 0,
+                    1 => 1,
+                    2 => 7,
+                    3 => 8,
+                    4 => 1024,
+                    5 => 8191,
+                    6 => 8192,
+                    7 => MAX_PAYLOAD_SIZE - 1,
+                    8 => MAX_PAYLOAD_SIZE,
+                    9 => MAX_PAYLOAD_SIZE + 1,
+                    _ => rng.random_range(1..=16 * 1024),
+                };
+                let chunk_seed = rng.random::<u64>();
+                let drop_without_flush = case_id.is_multiple_of(5);
+                let connector = connector_a.clone();
+
+                clients.spawn(async move {
+                    if case_id.is_multiple_of(3) {
+                        tokio::task::yield_now().await;
+                    }
+                    let mut stream = connector.connect().unwrap();
+                    let mut header = [0u8; 16];
+                    header[..8].copy_from_slice(&case_id.to_le_bytes());
+                    header[8..12].copy_from_slice(&(payload_len as u32).to_le_bytes());
+                    header[12] = u8::from(drop_without_flush);
+                    header[13..].copy_from_slice(b"smx");
+                    write_stress_chunks(&mut stream, &header, chunk_seed).await;
+
+                    let payload_seed = SEED ^ case_id;
+                    let payload = stress_payload(payload_seed, payload_len);
+                    if case_id.is_multiple_of(7) {
+                        stream.write_all(&payload).await.unwrap();
+                    } else {
+                        write_stress_chunks(&mut stream, &payload, chunk_seed ^ payload_seed).await;
+                    }
+
+                    if drop_without_flush {
+                        // Exercise the path that transfers accepted frames to
+                        // the global queue and puts FIN behind them.
+                        drop(stream);
+                        return;
+                    }
+
+                    if case_id.is_multiple_of(2) {
+                        stream.flush().await.unwrap();
+                    }
+                    let response_len = payload_len / 2 + case_id as usize % 257;
+                    let expected = stress_payload(!payload_seed, response_len);
+                    let mut actual = vec![0; response_len];
+                    stream.read_exact(&mut actual).await.unwrap();
+                    assert_eq!(actual, expected, "response mismatch for case {case_id}");
+                    // Tell the responder it may send FIN. Without this
+                    // application-level handshake, its valid early FIN can
+                    // race our final request flush and make the stress test
+                    // assert a stronger half-close contract than smux has.
+                    stream.write_all(&[0xac]).await.unwrap();
+                    stream.shutdown().await.unwrap();
+                });
+            }
+
+            let mut servers = tokio::task::JoinSet::new();
+            for _ in 0..streams_per_batch {
+                let mut stream = acceptor_b
+                    .accept()
+                    .await
+                    .expect("session closed during stress");
+                servers.spawn(async move {
+                    let mut header = [0u8; 16];
+                    stream.read_exact(&mut header).await.unwrap();
+                    assert_eq!(&header[13..], b"smx", "corrupted stress header");
+                    let case_id = u64::from_le_bytes(header[..8].try_into().unwrap());
+                    let payload_len =
+                        u32::from_le_bytes(header[8..12].try_into().unwrap()) as usize;
+                    let drop_without_flush = header[12] != 0;
+                    assert!(
+                        payload_len <= MAX_PAYLOAD_SIZE + 1,
+                        "invalid payload length in case {case_id}: {payload_len}"
+                    );
+
+                    let payload_seed = SEED ^ case_id;
+                    let expected = stress_payload(payload_seed, payload_len);
+                    let mut actual = vec![0; payload_len];
+                    stream.read_exact(&mut actual).await.unwrap();
+                    assert_eq!(actual, expected, "request mismatch for case {case_id}");
+
+                    if drop_without_flush {
+                        let mut byte = [0u8; 1];
+                        assert_eq!(
+                            stream.read(&mut byte).await.unwrap(),
+                            0,
+                            "case {case_id} delivered data after FIN"
+                        );
+                    } else {
+                        let response_len = payload_len / 2 + case_id as usize % 257;
+                        let response = stress_payload(!payload_seed, response_len);
+                        write_stress_chunks(&mut stream, &response, !case_id).await;
+                        if let Err(error) = stream.flush().await {
+                            assert_eq!(
+                                error.kind(),
+                                std::io::ErrorKind::ConnectionReset,
+                                "unexpected response flush error for case {case_id}: {error}"
+                            );
+                            // The client only sends FIN after verifying the
+                            // complete response, so this race still proves
+                            // that every accepted byte reached the peer.
+                            return;
+                        }
+                        let mut ack = [0u8; 1];
+                        stream.read_exact(&mut ack).await.unwrap();
+                        assert_eq!(ack, [0xac], "invalid completion ack for case {case_id}");
+                        stream.shutdown().await.unwrap();
+                    }
+                });
+            }
+
+            while let Some(result) = clients.join_next().await {
+                result.unwrap();
+            }
+            while let Some(result) = servers.join_next().await {
+                result.unwrap();
+            }
+
+            assert_eq!(connector_a.get_num_streams(), 0);
+            assert_eq!(connector_b.get_num_streams(), 0);
+            assert_eq!(
+                connector_a.get_num_tracked_streams(),
+                0,
+                "client retained stream handles after batch {batch}"
+            );
+            assert_eq!(
+                connector_b.get_num_tracked_streams(),
+                0,
+                "server retained stream handles after batch {batch}"
+            );
+            assert!(!worker_a.is_finished());
+            assert!(!worker_b.is_finished());
+        }
+
+        connector_a.close().await.unwrap();
+        let local_worker_result = tokio::time::timeout(Duration::from_secs(2), worker_a)
+            .await
+            .expect("local worker did not stop after stress close")
+            .unwrap();
+        assert!(matches!(
+            local_worker_result,
+            Ok(()) | Err(crate::error::MuxError::ConnectionClosed)
+        ));
+        let _ = tokio::time::timeout(Duration::from_secs(2), worker_b)
+            .await
+            .expect("peer worker did not observe stress close")
+            .unwrap();
+    }
+
+    #[test]
+    fn test_codec_randomized_fragmentation_round_trip() {
+        use bytes::{Bytes, BytesMut};
+        use tokio_util::codec::{Decoder, Encoder};
+
+        use crate::frame::{MuxCodec, MuxCommand, MuxFrame};
+
+        const SEED: u64 = 0xd15c_a11e_5eed_1234;
+        const FRAMES: usize = 256;
+        let mut rng = StdRng::seed_from_u64(SEED);
+        let mut encoder = MuxCodec {};
+        let mut wire = BytesMut::new();
+        let mut expected = Vec::with_capacity(FRAMES);
+
+        for index in 0..FRAMES {
+            let command = match rng.random_range(0..4) {
+                0 => MuxCommand::Sync,
+                1 => MuxCommand::Finish,
+                2 => MuxCommand::Push,
+                _ => MuxCommand::Nop,
+            };
+            let stream_id = if command == MuxCommand::Nop {
+                0
+            } else {
+                rng.random_range(1..=u32::MAX)
+            };
+            let payload_len = if command == MuxCommand::Push {
+                match index % 16 {
+                    0 => 0,
+                    1 => 1,
+                    2 => MAX_PAYLOAD_SIZE - 1,
+                    3 => MAX_PAYLOAD_SIZE,
+                    _ => rng.random_range(0..=4096),
+                }
+            } else {
+                0
+            };
+            let payload = stress_payload(rng.random(), payload_len);
+            encoder
+                .encode(
+                    MuxFrame::new(command, stream_id, Bytes::from(payload.clone())),
+                    &mut wire,
+                )
+                .unwrap();
+            expected.push((command, stream_id, payload));
+        }
+
+        let wire = wire.freeze();
+        let mut decoder = MuxCodec {};
+        let mut buffered = BytesMut::new();
+        let mut actual = Vec::with_capacity(FRAMES);
+        let mut offset = 0;
+        while offset < wire.len() {
+            let chunk_len = rng.random_range(1..=257).min(wire.len() - offset);
+            buffered.extend_from_slice(&wire[offset..offset + chunk_len]);
+            offset += chunk_len;
+            while let Some(frame) = decoder.decode(&mut buffered).unwrap() {
+                actual.push((
+                    frame.header.command,
+                    frame.header.stream_id,
+                    frame.payload.to_vec(),
+                ));
+            }
+        }
+        while let Some(frame) = decoder.decode(&mut buffered).unwrap() {
+            actual.push((
+                frame.header.command,
+                frame.header.stream_id,
+                frame.payload.to_vec(),
+            ));
+        }
+
+        assert!(buffered.is_empty());
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_stress_randomized_stream_lifecycles() {
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            run_randomized_lifecycle_stress(8, 48),
+        )
+        .await
+        .expect("randomized lifecycle stress test deadlocked");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_stress_sustained_bidirectional_backpressure() {
+        const STREAMS: usize = 24;
+        const ROUNDS: usize = 96;
+        const SEED_A: u64 = 0xa11c_e001_1234_5678;
+        const SEED_B: u64 = 0xb0b0_0002_8765_4321;
+
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let (a, b) = tokio::io::duplex(64);
+            let (connector_a, _acceptor_a, worker_a) = MuxBuilder::client()
+                .with_max_tx_queue(NonZeroUsize::new(1).unwrap())
+                .with_max_rx_queue(NonZeroUsize::new(1).unwrap())
+                .with_connection(a)
+                .build();
+            let (connector_b, mut acceptor_b, worker_b) = MuxBuilder::server()
+                .with_max_tx_queue(NonZeroUsize::new(1).unwrap())
+                .with_max_rx_queue(NonZeroUsize::new(1).unwrap())
+                .with_connection(b)
+                .build();
+            tokio::spawn(worker_a);
+            tokio::spawn(worker_b);
+
+            let mut pairs = Vec::with_capacity(STREAMS);
+            for _ in 0..STREAMS {
+                let local = connector_a.connect().unwrap();
+                let peer = acceptor_b.accept().await.unwrap();
+                pairs.push((local, peer));
+            }
+
+            let mut tasks = tokio::task::JoinSet::new();
+            for (index, (local, peer)) in pairs.into_iter().enumerate() {
+                tasks.spawn(async move {
+                    let a_seed = SEED_A ^ index as u64;
+                    let b_seed = SEED_B ^ index as u64;
+                    let before_shutdown = Arc::new(tokio::sync::Barrier::new(2));
+                    tokio::join!(
+                        run_full_duplex_stress(
+                            local,
+                            a_seed,
+                            b_seed,
+                            ROUNDS,
+                            before_shutdown.clone()
+                        ),
+                        run_full_duplex_stress(peer, b_seed, a_seed, ROUNDS, before_shutdown)
+                    );
+                });
+            }
+            while let Some(result) = tasks.join_next().await {
+                result.unwrap();
+            }
+
+            assert_eq!(connector_a.get_num_tracked_streams(), 0);
+            assert_eq!(connector_b.get_num_tracked_streams(), 0);
+        })
+        .await
+        .expect("sustained bidirectional backpressure test deadlocked");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_stress_concurrent_close_cancellation_and_stream_drop() {
+        use tokio::sync::oneshot;
+
+        const STREAMS: usize = 128;
+        const CLOSERS: usize = 24;
+        const PAYLOAD_LEN: usize = 257;
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let (a, mut peer) = tokio::io::duplex(64);
+            let (connector, acceptor, worker) = MuxBuilder::client().with_connection(a).build();
+            let worker = tokio::spawn(worker);
+
+            let mut streams = Vec::with_capacity(STREAMS);
+            for index in 0..STREAMS {
+                let mut stream = connector.connect().unwrap();
+                let payload = stress_payload(index as u64 + 1, PAYLOAD_LEN);
+                stream.write_all(&payload).await.unwrap();
+                streams.push(stream);
+            }
+            drop(streams);
+
+            let mut closers = Vec::with_capacity(CLOSERS);
+            for _ in 0..CLOSERS {
+                let mut connector = connector.clone();
+                let (started_tx, started_rx) = oneshot::channel();
+                let task = tokio::spawn(async move {
+                    let mut close = Box::pin(connector.close());
+                    let mut started_tx = Some(started_tx);
+                    poll_fn(|cx| match close.as_mut().poll(cx) {
+                        Poll::Pending => {
+                            if let Some(tx) = started_tx.take() {
+                                let _ = tx.send(());
+                            }
+                            Poll::Ready(())
+                        }
+                        Poll::Ready(result) => {
+                            panic!("close completed before the blocked carrier drained: {result:?}")
+                        }
+                    })
+                    .await;
+                    close.await
+                });
+                started_rx.await.unwrap();
+                closers.push(task);
+            }
+
+            for (index, closer) in closers.iter().enumerate() {
+                if index % 3 == 0 {
+                    closer.abort();
+                }
+            }
+
+            let reader = tokio::spawn(async move {
+                let mut wire = Vec::new();
+                peer.read_to_end(&mut wire).await.unwrap();
+                wire
+            });
+
+            for (index, closer) in closers.into_iter().enumerate() {
+                match closer.await {
+                    Err(error) if index % 3 == 0 => assert!(error.is_cancelled()),
+                    Ok(result) => result.unwrap(),
+                    Err(error) => panic!("active close task failed: {error}"),
+                }
+            }
+            let worker_result = worker.await.unwrap();
+            assert!(matches!(
+                worker_result,
+                Ok(()) | Err(crate::error::MuxError::ConnectionClosed)
+            ));
+            let wire = reader.await.unwrap();
+
+            let mut offset = 0;
+            let mut push_bytes = 0;
+            while offset < wire.len() {
+                assert!(wire.len() - offset >= 8, "truncated frame header");
+                let command = wire[offset + 1];
+                let payload_len = u16::from_le_bytes([wire[offset + 2], wire[offset + 3]]) as usize;
+                assert!(
+                    wire.len() - offset >= 8 + payload_len,
+                    "truncated frame payload"
+                );
+                if command == 2 {
+                    push_bytes += payload_len;
+                }
+                offset += 8 + payload_len;
+            }
+            assert_eq!(
+                push_bytes,
+                STREAMS * PAYLOAD_LEN,
+                "orderly close lost bytes accepted before shutdown"
+            );
+
+            drop((connector, acceptor));
+        })
+        .await
+        .expect("concurrent close/cancellation stress test deadlocked");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "long-running soak test; run explicitly in release mode"]
+    async fn test_soak_randomized_stream_lifecycles() {
+        tokio::time::timeout(
+            Duration::from_secs(120),
+            run_randomized_lifecycle_stress(64, 64),
+        )
+        .await
+        .expect("randomized lifecycle soak test deadlocked");
     }
 }

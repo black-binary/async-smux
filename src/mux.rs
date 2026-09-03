@@ -218,6 +218,11 @@ impl<T: TokioConn> MuxConnector<T> {
     pub(crate) fn is_closing_inline(&self) -> bool {
         self.state.lock().inline_closers > 0
     }
+
+    #[cfg(test)]
+    pub(crate) fn get_num_tracked_streams(&self) -> usize {
+        self.state.lock().handles.len()
+    }
 }
 
 impl<T: TokioConn> Clone for MuxConnector<T> {

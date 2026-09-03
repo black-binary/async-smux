@@ -25,6 +25,8 @@ jobs:
         run: cargo test --lib
       - name: Test (release)
         run: cargo test --lib --release
+      - name: Stress (release)
+        run: cargo test --lib --release test_soak_randomized_stream_lifecycles -- --ignored
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
