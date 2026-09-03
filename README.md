@@ -87,8 +87,9 @@ let (connector, acceptor, worker) = MuxBuilder::server()
     // Per-stream idle timeout (seconds): close streams with no
     // recent traffic.
     .with_idle_timeout(NonZeroU64::new(60).unwrap())
-    // Backpressure thresholds: cap how many frames may sit in the
-    // tx/rx queues before poll_write / poll_read park.
+    // Backpressure thresholds: cap queued tx frames and the combined
+    // inbound-frame/unaccepted-stream backlog. Keep-alive expiry pauses
+    // while the RX budget deliberately prevents carrier reads.
     .with_max_tx_queue(NonZeroUsize::new(1024).unwrap())
     .with_max_rx_queue(NonZeroUsize::new(1024).unwrap())
     .with_connection(connection)

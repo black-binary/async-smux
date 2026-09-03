@@ -14,6 +14,8 @@ pub enum MuxError {
     InvalidControlFramePayload(u16),
     #[error("Reserved stream id {0}")]
     ReservedStreamId(u32),
+    #[error("NOP frame must use stream id 0, got {0}")]
+    InvalidNopStreamId(u32),
     #[error("Duplicated stream id {0}")]
     DuplicatedStreamId(u32),
 

@@ -30,6 +30,8 @@ pub struct MuxConfig {
     pub idle_timeout: Option<NonZeroU64>,
     /// Backpressure threshold for outbound frames per stream.
     pub max_tx_queue: NonZeroUsize,
-    /// Backpressure threshold for inbound frames across the session.
+    /// Backpressure threshold for inbound frames and unaccepted streams
+    /// across the session. Dead-peer detection is suspended while this
+    /// budget is exhausted because the carrier is intentionally not polled.
     pub max_rx_queue: NonZeroUsize,
 }
