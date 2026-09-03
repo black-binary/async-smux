@@ -46,6 +46,14 @@
 //! and it is cancellation-safe: dropping the future mid-flight hands
 //! control back to the worker without wedging it.
 //!
+//! [`MuxStream`] supports TCP-style half-close. Calling
+//! [`AsyncWriteExt::shutdown`](tokio::io::AsyncWriteExt::shutdown) sends FIN
+//! and closes only the local write direction; reads remain open until the
+//! peer sends its FIN. A peer FIN likewise produces read EOF without
+//! preventing a response from being written. This does not change the wire
+//! format; peers must also interpret FIN as directional EOF to write after
+//! receiving it.
+//!
 //! # Configuration
 //!
 //! See [`MuxBuilder`] for the available knobs: `with_keep_alive_interval`,
@@ -396,19 +404,20 @@ mod tests {
         stream2.write_all(&data).await.unwrap();
         stream2.shutdown().await.unwrap();
 
-        tokio::time::sleep(Duration::from_secs(1)).await;
-
-        stream1.write_all(&[0, 1, 2, 3]).await.unwrap_err();
-        stream1.flush().await.unwrap_err();
         let mut buf = vec![0; 4];
         stream1.read_exact(&mut buf).await.unwrap();
         assert_eq!(buf, data);
         assert_eq!(stream1.read(&mut buf).await.unwrap(), 0);
+        stream1.write_all(&[4, 5, 6, 7]).await.unwrap();
+        stream1.shutdown().await.unwrap();
+        stream2.read_exact(&mut buf).await.unwrap();
+        assert_eq!(buf, [4, 5, 6, 7]);
+        assert_eq!(stream2.read(&mut buf).await.unwrap(), 0);
 
         drop(acceptor_a);
         let mut stream = connector_b.connect().unwrap();
         assert_eq!(stream.read(&mut buf).await.unwrap(), 0);
-        stream.flush().await.unwrap_err();
+        stream.flush().await.unwrap();
         stream.shutdown().await.unwrap();
 
         let mut stream1 = connector_a.connect().unwrap();
@@ -422,7 +431,7 @@ mod tests {
         stream2.read_exact(&mut buf).await.unwrap();
         assert!(buf == data);
         stream2.read_exact(&mut buf).await.unwrap_err();
-        stream2.write_all(&data).await.unwrap_err();
+        stream2.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -537,6 +546,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_half_close_fin_before_accept_allows_response() {
+        let (a, b) = tokio::io::duplex(4096);
+        let (connector_a, _acceptor_a, worker_a) = MuxBuilder::client().with_connection(a).build();
+        let (_connector_b, mut acceptor_b, worker_b) =
+            MuxBuilder::server().with_connection(b).build();
+        tokio::spawn(worker_a);
+        tokio::spawn(worker_b);
+
+        let mut client = connector_a.connect().unwrap();
+        client.write_all(b"request before accept").await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let mut server = acceptor_b.accept().await.unwrap();
+        let mut request = Vec::new();
+        server.read_to_end(&mut request).await.unwrap();
+        assert_eq!(request, b"request before accept");
+
+        server.write_all(b"response after accept").await.unwrap();
+        server.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert_eq!(response, b"response after accept");
+    }
+
+    #[tokio::test]
+    async fn test_half_close_repeated_shutdown_sends_one_fin() {
+        let (a, mut peer) = tokio::io::duplex(1024);
+        let (connector, acceptor, worker) = MuxBuilder::client().with_connection(a).build();
+        tokio::spawn(worker);
+
+        let mut stream = connector.connect().unwrap();
+        let stream_id = stream.get_stream_id();
+        stream.shutdown().await.unwrap();
+        stream.shutdown().await.unwrap();
+        drop(stream);
+        drop(connector);
+        drop(acceptor);
+
+        let mut wire = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), peer.read_to_end(&mut wire))
+            .await
+            .expect("session did not close after dropping every public handle")
+            .unwrap();
+        assert_eq!(
+            wire.len(),
+            16,
+            "repeated shutdown or Drop emitted extra data"
+        );
+        assert_eq!(wire[1], 0, "first frame was not SYN");
+        assert_eq!(
+            u32::from_le_bytes(wire[4..8].try_into().unwrap()),
+            stream_id
+        );
+        assert_eq!(wire[9], 1, "second frame was not FIN");
+        assert_eq!(
+            u32::from_le_bytes(wire[12..16].try_into().unwrap()),
+            stream_id
+        );
+    }
+
+    #[tokio::test]
+    async fn test_half_close_simultaneous_fin_preserves_crossed_data() {
+        let (mut left, mut right) = get_duplex_mux_pair().await;
+
+        left.write_all(b"from left").await.unwrap();
+        right.write_all(b"from right").await.unwrap();
+        let (left_shutdown, right_shutdown) = tokio::join!(left.shutdown(), right.shutdown());
+        left_shutdown.unwrap();
+        right_shutdown.unwrap();
+
+        let mut received_left = Vec::new();
+        let mut received_right = Vec::new();
+        let (left_read, right_read) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(
+                left.read_to_end(&mut received_left),
+                right.read_to_end(&mut received_right)
+            )
+        })
+        .await
+        .expect("crossed FINs did not produce EOF");
+        left_read.unwrap();
+        right_read.unwrap();
+
+        assert_eq!(received_left, b"from right");
+        assert_eq!(received_right, b"from left");
+        assert!(left.is_closed());
+        assert!(right.is_closed());
+    }
+
+    #[tokio::test]
     async fn test_timeout() {
         let (a, b) = get_tcp_pair().await;
         let (connector_a, _, worker_a) = MuxBuilder::client()
@@ -552,7 +651,7 @@ mod tests {
         });
 
         let stream1 = connector_a.connect().unwrap();
-        let stream2 = acceptor_b.accept().await.unwrap();
+        let mut stream2 = acceptor_b.accept().await.unwrap();
         tokio::time::sleep(Duration::from_secs(1)).await;
         assert!(!stream1.is_closed());
         assert!(!stream2.is_closed());
@@ -560,6 +659,10 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(5)).await;
 
         assert!(stream1.is_closed());
+        assert!(!stream2.is_closed());
+        let mut byte = [0u8; 1];
+        assert_eq!(stream2.read(&mut byte).await.unwrap(), 0);
+        stream2.shutdown().await.unwrap();
         assert!(stream2.is_closed());
     }
 
@@ -609,20 +712,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_connection_drop() {
+    async fn test_stream_drop_delivers_read_eof() {
         let (a, b) = get_tcp_pair().await;
         let (connector_a, _, worker_a) = MuxBuilder::client().with_connection(a).build();
         let (_, mut acceptor_b, worker_b) = MuxBuilder::server().with_connection(b).build();
         tokio::spawn(worker_a);
         tokio::spawn(worker_b);
 
-        let mut _stream1 = connector_a.connect().unwrap();
+        let stream1 = connector_a.connect().unwrap();
         let mut stream2 = acceptor_b.accept().await.unwrap();
 
-        drop(_stream1);
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        drop(stream1);
 
-        assert!(stream2.write_all(b"1234").await.is_err());
+        let mut byte = [0u8; 1];
+        assert_eq!(stream2.read(&mut byte).await.unwrap(), 0);
+        assert!(
+            !stream2.is_closed(),
+            "peer drop closes only this stream's read direction"
+        );
+
+        stream2.shutdown().await.unwrap();
+        assert!(stream2.is_closed());
     }
 
     #[tokio::test]
@@ -748,43 +858,38 @@ mod tests {
         assert_eq!(buf, data);
     }
 
-    // BUG: After local shutdown we returned EOF, but a subsequent peer Push
-    // (peer hadn't seen our FIN yet) would still populate rx_queue and a later
-    // poll_read would surface that data, breaking AsyncRead EOF monotonicity.
+    // Once a peer FIN has produced EOF, a protocol-invalid late PSH must not
+    // make a subsequent read return data or implicitly close our write half.
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_eof_monotonic_after_local_shutdown() {
-        let (a, b) = get_tcp_pair().await;
-        let (connector_a, _, worker_a) = MuxBuilder::client().with_connection(a).build();
-        let (_, mut acceptor_b, worker_b) = MuxBuilder::server().with_connection(b).build();
-        tokio::spawn(worker_a);
-        tokio::spawn(worker_b);
+    async fn test_eof_monotonic_after_remote_fin() {
+        let (a, mut peer) = tokio::io::duplex(4096);
+        let (_connector, mut acceptor, worker) = MuxBuilder::client().with_connection(a).build();
+        tokio::spawn(worker);
 
-        let mut stream1 = connector_a.connect().unwrap();
-        let mut stream2 = acceptor_b.accept().await.unwrap();
+        let stream_id = 2;
+        peer.write_all(&raw_frame(0, stream_id, &[])).await.unwrap();
+        let mut stream = acceptor.accept().await.unwrap();
+        peer.write_all(&raw_frame(1, stream_id, &[])).await.unwrap();
 
-        // Local shutdown -> our handle.closed=true, FIN enqueued globally.
-        stream1.shutdown().await.unwrap();
-
-        // First read sees EOF immediately (rx_queue empty + handle.closed).
         let mut buf = [0u8; 4];
-        let n = stream1.read(&mut buf).await.unwrap();
-        assert_eq!(n, 0, "first read after shutdown must be EOF");
+        assert_eq!(stream.read(&mut buf).await.unwrap(), 0);
 
-        // Peer races and writes data before processing our FIN. Inject a
-        // PSH frame on the wire from b's side - but stream2's writer is
-        // still open from b's perspective.
-        let _ = stream2.write_all(b"late").await;
-        let _ = stream2.flush().await;
+        peer.write_all(&raw_frame(2, stream_id, b"late"))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
 
-        // Give the dispatcher time to receive the late PSH.
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(stream.read(&mut buf).await.unwrap(), 0);
 
-        // EOF must remain EOF.
-        let n = stream1.read(&mut buf).await.unwrap();
-        assert_eq!(
-            n, 0,
-            "subsequent read must remain EOF, not return late data"
-        );
+        stream.write_all(b"reply").await.unwrap();
+        stream.flush().await.unwrap();
+        let mut wire = [0u8; 13];
+        tokio::time::timeout(Duration::from_secs(1), peer.read_exact(&mut wire))
+            .await
+            .expect("reply was not sent after remote FIN")
+            .unwrap();
+        assert_eq!(wire[1], 2, "late PSH caused an implicit local FIN");
+        assert_eq!(&wire[8..], b"reply");
     }
 
     // BUG: poll_flush returns Err the moment the stream is locally closed,
@@ -803,8 +908,8 @@ mod tests {
 
         let data = b"hello world";
         stream1.write_all(data).await.unwrap();
-        // shutdown will mark our handle.closed=true and enqueue FIN. Pending
-        // PSH frames from the write_all above should still go out.
+        // shutdown closes the local write half and enqueues FIN. Pending PSH
+        // frames from the write_all above should still go out first.
         stream1.shutdown().await.unwrap();
 
         let mut buf = vec![0u8; data.len()];
@@ -1439,13 +1544,12 @@ mod tests {
         peer.write_all(&raw_frame(1, stream_id, &[])).await.unwrap();
         tokio::spawn(worker);
 
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !stream.is_closed() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("remote FIN was not dispatched");
+        let mut byte = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut byte))
+            .await
+            .expect("remote FIN was not dispatched")
+            .unwrap();
+        assert_eq!(n, 0);
 
         drop(stream);
         drop(connector);
@@ -1458,7 +1562,7 @@ mod tests {
             .unwrap();
 
         let payload_frames = payload.len().div_ceil(MAX_PAYLOAD_SIZE);
-        let expected = 8 + payload_frames * 8 + payload.len(); // SYN + PSHs
+        let expected = 8 + payload_frames * 8 + payload.len() + 8; // SYN + PSHs + FIN
         assert_eq!(
             wire.len(),
             expected,
@@ -1864,10 +1968,8 @@ mod tests {
                     let mut actual = vec![0; response_len];
                     stream.read_exact(&mut actual).await.unwrap();
                     assert_eq!(actual, expected, "response mismatch for case {case_id}");
-                    // Tell the responder it may send FIN. Without this
-                    // application-level handshake, its valid early FIN can
-                    // race our final request flush and make the stress test
-                    // assert a stronger half-close contract than smux has.
+                    // Coordinate completion so both FIN paths are exercised
+                    // deterministically before the tasks finish.
                     stream.write_all(&[0xac]).await.unwrap();
                     stream.shutdown().await.unwrap();
                 });
@@ -1909,17 +2011,7 @@ mod tests {
                         let response_len = payload_len / 2 + case_id as usize % 257;
                         let response = stress_payload(!payload_seed, response_len);
                         write_stress_chunks(&mut stream, &response, !case_id).await;
-                        if let Err(error) = stream.flush().await {
-                            assert_eq!(
-                                error.kind(),
-                                std::io::ErrorKind::ConnectionReset,
-                                "unexpected response flush error for case {case_id}: {error}"
-                            );
-                            // The client only sends FIN after verifying the
-                            // complete response, so this race still proves
-                            // that every accepted byte reached the peer.
-                            return;
-                        }
+                        stream.flush().await.unwrap();
                         let mut ack = [0u8; 1];
                         stream.read_exact(&mut ack).await.unwrap();
                         assert_eq!(ack, [0xac], "invalid completion ack for case {case_id}");
