@@ -71,6 +71,15 @@ The worker exits when:
 sink is closed. It also works without the worker being polled — useful
 in test setups or sync teardown paths.
 
+`MuxStream` supports TCP-style half-close. Calling
+`AsyncWriteExt::shutdown()` sends FIN and closes only the local write
+direction; reads remain open until the peer sends its FIN. Likewise, a
+peer FIN produces read EOF without preventing a response from being
+written. Dropping a stream drains writes already accepted by
+`poll_write`, sends FIN if needed, and releases the local stream handle.
+The wire format is unchanged; a peer must also interpret FIN as directional
+EOF to send data after receiving it.
+
 ## Configuration
 
 ```rust,ignore
@@ -107,7 +116,7 @@ VERSION(1B) | CMD(1B) | LENGTH(2B LE) | STREAMID(4B LE) | DATA(LENGTH)
 VERSION: 1
 CMD:
     SYN(0)  open stream  (LENGTH must be 0)
-    FIN(1)  close stream (LENGTH must be 0)
+    FIN(1)  close sender's write direction (LENGTH must be 0)
     PSH(2)  payload
     NOP(3)  keep-alive   (LENGTH must be 0; STREAMID is 0)
 ```
